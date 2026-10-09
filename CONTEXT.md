@@ -1,22 +1,24 @@
 # Cap
 
-Cap records screens, cameras and audio, and turns recordings into editable and shareable videos.
+语言：**简体中文** | [English](./CONTEXT.en.md)
 
-## Language
+Cap 可录制屏幕、摄像头画面和音频，并将录制内容制作成可编辑、可分享的视频。
 
-**Recording**:
-Captured media and metadata belonging to one capture session.
+## 领域术语
 
-**Source index**:
-A recording's manifest, recording metadata and video sample locations, used to select the media needed for an export.
-_Avoid_: Export index, job index
+**录制（Recording）**：
+一次录制会话产生的媒体素材及其元数据。
 
-**Source scope**:
-The set of recording assets a particular export or indexing request is allowed to reference.
-_Avoid_: Cache scope
+**素材索引（Source index）**：
+包含录制文件清单、录制元数据及视频采样位置的索引，用于确定导出所需的媒体素材。
+_避免混用_：导出索引（Export index）、任务索引（job index）
 
-**Transcode**:
-A version of captured media converted into a format usable for editing and export.
+**素材范围（Source scope）**：
+某次导出或索引请求允许引用的录制素材集合。
+_避免混用_：缓存范围（Cache scope）
 
-**Stitching**:
-Joining rendered media pieces into one exported video.
+**转码产物（Transcode）**：
+录制素材转换为可用于编辑和导出的格式后得到的媒体版本。
+
+**拼接（Stitching）**：
+将渲染后的媒体片段连接成一个导出视频的过程。
