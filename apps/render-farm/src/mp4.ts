@@ -227,19 +227,13 @@ export function byteRangeFor(index: TrackIndex, from: number, to: number) {
 			high = middle - 1;
 		}
 	}
-	let last = count - 1;
-	for (let sample = first; sample < count; sample++) {
-		if ((index.times[sample] ?? 0) > to) {
-			last = sample;
-			break;
-		}
-	}
 	let start = Number.POSITIVE_INFINITY;
 	let end = 0;
-	for (let sample = first; sample <= last; sample++) {
+	for (let sample = first; sample < count; sample++) {
 		const offset = index.offsets[sample] ?? 0;
 		start = Math.min(start, offset);
 		end = Math.max(end, offset + (index.sizes[sample] ?? 0));
+		if ((index.times[sample] ?? 0) > to) break;
 	}
 	return { start, end };
 }
@@ -248,39 +242,67 @@ export function byteRangeFor(index: TrackIndex, from: number, to: number) {
 
 class Writer {
 	private chunks: Uint8Array[] = [];
+	private page?: { bytes: Uint8Array; view: DataView; used: number };
 	length = 0;
 
+	private flushPage() {
+		if (this.page?.used) {
+			this.chunks.push(this.page.bytes.subarray(0, this.page.used));
+		}
+		this.page = undefined;
+	}
+
+	private reserve(size: number) {
+		let page = this.page;
+		if (!page || page.used + size > page.bytes.byteLength) {
+			const capacity = page ? Math.min(page.bytes.byteLength * 2, 4096) : 256;
+			this.flushPage();
+			const bytes = new Uint8Array(capacity);
+			page = { bytes, view: new DataView(bytes.buffer), used: 0 };
+			this.page = page;
+		}
+		return page;
+	}
+
 	bytes(value: Uint8Array) {
+		this.flushPage();
 		this.chunks.push(value);
 		this.length += value.byteLength;
 	}
 
 	u8(value: number) {
-		this.bytes(Uint8Array.of(value & 0xff));
+		const page = this.reserve(1);
+		page.view.setUint8(page.used, value & 0xff);
+		page.used++;
+		this.length++;
 	}
 
 	u16(value: number) {
-		const buffer = new Uint8Array(2);
-		new DataView(buffer.buffer).setUint16(0, value);
-		this.bytes(buffer);
+		const page = this.reserve(2);
+		page.view.setUint16(page.used, value);
+		page.used += 2;
+		this.length += 2;
 	}
 
 	u32(value: number) {
-		const buffer = new Uint8Array(4);
-		new DataView(buffer.buffer).setUint32(0, value >>> 0);
-		this.bytes(buffer);
+		const page = this.reserve(4);
+		page.view.setUint32(page.used, value >>> 0);
+		page.used += 4;
+		this.length += 4;
 	}
 
 	u64(value: number) {
-		const buffer = new Uint8Array(8);
-		new DataView(buffer.buffer).setBigUint64(0, BigInt(value));
-		this.bytes(buffer);
+		const page = this.reserve(8);
+		page.view.setBigUint64(page.used, BigInt(value));
+		page.used += 8;
+		this.length += 8;
 	}
 
 	i16(value: number) {
-		const buffer = new Uint8Array(2);
-		new DataView(buffer.buffer).setInt16(0, value);
-		this.bytes(buffer);
+		const page = this.reserve(2);
+		page.view.setInt16(page.used, value);
+		page.used += 2;
+		this.length += 2;
 	}
 
 	ascii(value: string) {
@@ -298,6 +320,7 @@ class Writer {
 			out.set(chunk, offset);
 			offset += chunk.byteLength;
 		}
+		if (this.page) out.set(this.page.bytes.subarray(0, this.page.used), offset);
 		return out;
 	}
 }
@@ -768,14 +791,36 @@ export function buildHeader(input: HeaderInput) {
 		return { ftyp, moov };
 	};
 
-	// The moov's size doesn't depend on the offsets (co64 is fixed width), so
-	// measure once, then lay out: ftyp, moov, free padding only when a minimum
-	// size asks for it, 16-byte mdat header.
-	const probe = make(0);
-	const bare = probe.ftyp.byteLength + probe.moov.byteLength + 16;
+	const final = make(0);
+	const bare = final.ftyp.byteLength + final.moov.byteLength + 16;
 	const headerSize =
 		input.minimumSize <= bare ? bare : Math.max(input.minimumSize, bare + 8);
-	const final = make(headerSize);
+	const root = readBoxes(final.moov, 0, final.moov.byteLength)[0];
+	if (!root) throw new Error("missing generated moov");
+	const tracks = children(final.moov, root, "trak");
+	const trackRuns = [
+		input.video.runs,
+		...(input.audio ? [input.audio.runs] : []),
+	];
+	const offsets = new DataView(
+		final.moov.buffer,
+		final.moov.byteOffset,
+		final.moov.byteLength,
+	);
+	for (const [index, runs] of trackRuns.entries()) {
+		const track = tracks[index];
+		const mdia = track && child(final.moov, track, "mdia");
+		const minf = mdia && child(final.moov, mdia, "minf");
+		const stbl = minf && child(final.moov, minf, "stbl");
+		const co64 = stbl && child(final.moov, stbl, "co64");
+		if (!co64) throw new Error("missing generated chunk offsets");
+		let position = co64.start + co64.headerSize + 8;
+		for (const run of runs) {
+			// Adding to encoded BigInts would change Number rounding above 2^53.
+			offsets.setBigUint64(position, BigInt(run.offset + headerSize));
+			position += 8;
+		}
+	}
 	const freeSize =
 		headerSize - final.ftyp.byteLength - final.moov.byteLength - 16;
 	const free = new Uint8Array(freeSize);

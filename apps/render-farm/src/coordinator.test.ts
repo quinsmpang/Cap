@@ -7,21 +7,30 @@ import {
 } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { ANNEX_B_PARAMETER_SETS } from "./boxes.test-util";
+import { ConcurrencyLimiter } from "./concurrency-limiter";
 import type { Job, TaskState } from "./coordinator";
 import * as fmp4 from "./fmp4";
 import * as hls from "./hls";
+import { ProjectCache } from "./materialize";
 import * as mp4 from "./mp4";
 import * as planning from "./planning";
 import * as protocol from "./protocol";
 import * as recovery from "./recovery";
 import { pickQueued } from "./scheduler";
+import { SourceIndexes } from "./source-index";
 import * as stitch from "./stitch";
+import { TranscodeInputs } from "./transcode-inputs";
 import * as validate from "./validate";
 
 function harness(env: Record<string, string> = {}) {
 	const objects = new Map<string, Uint8Array>();
 	const writes: string[] = [];
 	const ranges: string[] = [];
+	const heads: string[] = [];
+	const deleted: string[] = [];
+	const deleteFailures = new Set<string>();
+	const deleteLoad = { active: 0, peak: 0 };
+	let deleteGate: Promise<void> | undefined;
 	const uploadedParts = new Map<string, Uint8Array>();
 	const modifiedAt = new Map<string, number>();
 	let listFailures = 0;
@@ -34,12 +43,15 @@ function harness(env: Record<string, string> = {}) {
 	const watchdogs: (() => void)[] = [];
 	let putGate: Promise<void> | undefined;
 	let headGate: Promise<void> | undefined;
+	let afterHead: (key: string) => void = () => {};
 	let failures = 0;
 	const callbacks: { url: string; init: RequestInit }[] = [];
 	const s3 = {
 		async head(key: string) {
+			heads.push(key);
 			await headGate;
 			const value = objects.get(key);
+			afterHead(key);
 			return value ? { size: value.byteLength } : null;
 		},
 		async put(key: string, body: Uint8Array | string) {
@@ -132,7 +144,15 @@ function harness(env: Record<string, string> = {}) {
 			return true;
 		},
 		async delete(key: string) {
-			objects.delete(key);
+			deleteLoad.peak = Math.max(deleteLoad.peak, ++deleteLoad.active);
+			try {
+				await deleteGate;
+				deleted.push(key);
+				if (deleteFailures.has(key)) throw new Error("injected delete failure");
+				objects.delete(key);
+			} finally {
+				deleteLoad.active--;
+			}
 		},
 		async abortMultipart() {},
 	};
@@ -159,6 +179,9 @@ function harness(env: Record<string, string> = {}) {
 		...recovery,
 		...stitch,
 		pickQueuedTask: pickQueued,
+		SourceIndexes,
+		TranscodeInputs,
+		ConcurrencyLimiter,
 		S3: class {
 			constructor() {
 				Object.assign(this, s3);
@@ -202,7 +225,7 @@ function harness(env: Record<string, string> = {}) {
 	const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(source);
 	const coordinator = new Function(
 		...Object.keys(deps),
-		`${compiled}\nreturn {jobs, queue, straggler, dispatchedTask, onVideoDone, onAudioDone, publishPlaylist, journalJob, resumeJobs, newHlsState, finish, requeue, sourceIndex, assemble, stitchAhead, sweepStashes, setPlanner: (fn) => { planJob = fn; }};`,
+		`${compiled}\nreturn {jobs, queue, pickQueued, straggler, dispatchedTask, onVideoDone, onAudioDone, publishPlaylist, journalJob, resumeJobs, newHlsState, finish, requeue, sourceIndex: sourceIndexes.get.bind(sourceIndexes), assemble, stitchAhead, sweepStashes, setPlanner: (fn) => { planJob = fn; }};`,
 	)(...Object.values(deps)) as {
 		setPlanner: (fn: (job: Job) => Promise<void>) => void;
 		sourceIndex: (prefix: string, sourceRoot?: string) => Promise<unknown>;
@@ -212,6 +235,7 @@ function harness(env: Record<string, string> = {}) {
 		requeue: (state: TaskState, reason: string) => void;
 		jobs: Map<string, Job>;
 		queue: TaskState[];
+		pickQueued: (accepts: (kind: string) => boolean) => number;
 		straggler: () => TaskState | undefined;
 		dispatchedTask: (job: Job, state: TaskState) => Promise<protocol.Task>;
 		onVideoDone: (
@@ -236,6 +260,13 @@ function harness(env: Record<string, string> = {}) {
 		objects,
 		writes,
 		ranges,
+		heads,
+		deleted,
+		deleteLoad,
+		deleteFailures,
+		gateDeletes: (gate?: Promise<void>) => {
+			deleteGate = gate;
+		},
 		uploadedParts,
 		copies,
 		copying,
@@ -257,6 +288,9 @@ function harness(env: Record<string, string> = {}) {
 		},
 		gateHead: (gate?: Promise<void>) => {
 			headGate = gate;
+		},
+		afterHead: (callback: (key: string) => void) => {
+			afterHead = callback;
 		},
 		fail: (count = 1) => {
 			failures = count;
@@ -515,6 +549,108 @@ describe("assembly", () => {
 		};
 	}
 
+	test("incremental stitching waits for gaps and skips already planned chunks", async () => {
+		const h = harness();
+		const j = longJob("incremental", 3);
+		let reads = 0;
+		for (const index of [0, 2]) {
+			const value = stored(h, j, index, 2 * protocol.MIN_PART, index + 1);
+			const stash = value.stash;
+			Object.defineProperty(value, "stash", {
+				get: () => {
+					reads++;
+					return stash;
+				},
+			});
+			j.videoResults.set(index, value);
+		}
+		h.stitchAhead(j);
+		await Promise.all(j.headerStashes?.values() ?? []);
+		const plannedReads = reads;
+		for (let index = 0; index < 5; index++) h.stitchAhead(j);
+		expect(reads).toBe(plannedReads);
+		expect(j.stitchPlan?.nextChunk).toBe(1);
+		expect(h.copies).toEqual([]);
+		j.videoResults.set(1, stored(h, j, 1, 2 * protocol.MIN_PART, 2));
+		h.stitchAhead(j);
+		await Promise.all(j.stitchParts?.values() ?? []);
+		expect(j.stitchPlan?.nextChunk).toBe(3);
+		expect(h.copies).toHaveLength(2);
+		const completeReads = reads;
+		h.stitchAhead(j);
+		expect(reads).toBe(completeReads);
+		await h.assemble(j);
+		expect(h.copies).toHaveLength(2);
+		expect(j.stitchPlan).toBeUndefined();
+	});
+
+	test("failed header reads and part copies retry without new chunk results", async () => {
+		const h = harness();
+		const j = job();
+		for (const index of [0, 1])
+			j.videoResults.set(
+				index,
+				stored(h, j, index, 2 * protocol.MIN_PART, index + 1),
+			);
+		const first = j.videoResults.get(0) as protocol.VideoResult;
+		const header = h.objects.get(first.stash.key) as Uint8Array;
+		h.objects.delete(first.stash.key);
+		let attempts = 0;
+		h.gateCopies(() =>
+			++attempts === 1 ? Promise.reject(new Error("copy failed")) : undefined,
+		);
+		h.stitchAhead(j);
+		await Promise.allSettled([
+			...(j.headerStashes?.values() ?? []),
+			...(j.stitchParts?.values() ?? []),
+		]);
+		expect(j.headerStashes?.size).toBe(0);
+		expect(j.stitchParts?.size).toBe(0);
+		h.objects.set(first.stash.key, header);
+		h.stitchAhead(j);
+		await Promise.all([
+			...(j.headerStashes?.values() ?? []),
+			...(j.stitchParts?.values() ?? []),
+		]);
+		expect(j.headerStashes?.size).toBe(1);
+		expect(j.stitchParts?.size).toBe(1);
+		expect(attempts).toBe(2);
+		await h.assemble(j);
+		expect(attempts).toBe(2);
+	});
+
+	test("a small final part remains valid when failures retry out of plan order", async () => {
+		const h = harness();
+		const j = longJob("tail-retry", 3);
+		for (const [index, bytes] of [
+			2 * protocol.MIN_PART,
+			2 * protocol.MIN_PART,
+			100,
+		].entries()) {
+			j.videoResults.set(index, stored(h, j, index, bytes, index + 1));
+		}
+		const gates = [
+			Promise.withResolvers<void>(),
+			Promise.withResolvers<void>(),
+		];
+		let attempts = 0;
+		h.gateCopies(() => gates[attempts++]?.promise);
+		h.stitchAhead(j);
+		const completed = Promise.allSettled(j.stitchParts?.values() ?? []);
+		await Bun.sleep(0);
+		gates[1]?.reject(new Error("tail failed"));
+		await Bun.sleep(0);
+		gates[0]?.reject(new Error("middle failed"));
+		await completed;
+		expect(j.stitchPlan?.retryParts.size).toBe(2);
+		h.stitchAhead(j);
+		await Promise.all(j.stitchParts?.values() ?? []);
+		expect(attempts).toBe(4);
+		expect(j.stitchPlan?.retryParts.size).toBe(0);
+		await h.assemble(j);
+		expect(attempts).toBe(4);
+	});
+
 	test("stitching ahead stays within its share across jobs and assembly reuses it", async () => {
 		const h = harness();
 		const jobs = [longJob("a", 12), longJob("b", 12), longJob("c", 12)];
@@ -607,6 +743,54 @@ describe("assembly", () => {
 		h.timers.shift()?.();
 		await resumed;
 		expect(h.objects.has("stash/gone/c0-p3")).toBe(false);
+	});
+
+	test("job cleanup and the periodic sweep share one deletion budget", async () => {
+		const h = harness();
+		const done = job();
+		done.status = "ready";
+		h.jobs.set(done.id, done);
+		h.jobs.set("live", { ...job(), id: "live" });
+		for (let index = 0; index < 64; index++)
+			h.objects.set(`stash/job/${index}`, new Uint8Array(1));
+		h.objects.set("stash/live/0", new Uint8Array(1));
+		const gate = Promise.withResolvers<void>();
+		h.gateDeletes(gate.promise);
+		h.finish(done);
+		const sweep = h.resumeJobs();
+		try {
+			await Bun.sleep(0);
+			expect(h.deleteLoad.active).toBe(16);
+		} finally {
+			gate.resolve();
+		}
+		await sweep;
+		expect(h.deleteLoad).toEqual({ active: 0, peak: 16 });
+		expect(new Set(h.deleted).size).toBe(64);
+		expect(h.objects.has("stash/live/0")).toBe(true);
+		expect(
+			[...h.objects.keys()].filter((key) => key.startsWith("stash/job/")),
+		).toEqual([]);
+	});
+
+	test("failed deletions release slots and the next sweep retries residual objects", async () => {
+		const h = harness();
+		await h.resumeJobs();
+		h.jobs.set("done", { ...job(), id: "done", status: "ready" });
+		for (let index = 0; index < 40; index++)
+			h.objects.set(`stash/done/${index}`, new Uint8Array(1));
+		h.deleteFailures.add("stash/done/0");
+		await expect(h.sweepStashes()).rejects.toThrow("injected delete failure");
+		while (h.deleted.length < 40 || h.deleteLoad.active > 0) await Bun.sleep(0);
+		expect(h.deleteLoad.peak).toBeLessThanOrEqual(16);
+		expect(
+			[...h.objects.keys()].filter((key) => key.startsWith("stash/done/")),
+		).toEqual(["stash/done/0"]);
+		h.deleteFailures.clear();
+		await h.sweepStashes();
+		expect(h.deleted.filter((key) => key === "stash/done/0")).toHaveLength(2);
+		expect(h.objects.has("stash/done/0")).toBe(false);
+		expect(h.deleteLoad.active).toBe(0);
 	});
 
 	test("a result whose parts leave a gap in the chunk is refused", async () => {
@@ -908,6 +1092,94 @@ function call(
 	);
 }
 
+describe("job statistics", () => {
+	type Metric = { p50: number | null; p95: number | null; max: number | null };
+	type Summary = {
+		video: Record<string, Metric>;
+		audio: Record<string, Metric>;
+		duplicates: number;
+		tasks: Record<string, unknown>[];
+		verified?: boolean;
+	};
+	const get = async (h: ReturnType<typeof harness>, j: Job) => {
+		const response = await call(h, `/jobs/${j.id}`);
+		expect(response.status).toBe(200);
+		return (await response.json()) as Summary;
+	};
+
+	test("all metrics keep floor ranks, rounding, task order and duplicate rules", async () => {
+		const h = harness();
+		const j = job();
+		h.jobs.set(j.id, j);
+		for (const kind of ["video", "audio"]) {
+			for (let index = 19; index >= 0; index--) {
+				const value = index + 0.6;
+				j.taskStats.push({
+					kind,
+					index,
+					totalMs: value,
+					fetchMs: value,
+					engineRenderMs: value,
+					engineMs: value,
+					audioWaitMs: value,
+					uploadMs: value,
+					queuedMs: value,
+				});
+			}
+		}
+		j.taskStats.push({ kind: "video", duplicate: true, totalMs: 1000 });
+		j.taskStats.push({ kind: "audio", duplicate: true, totalMs: 1000 });
+		const original = structuredClone(j.taskStats);
+		const body = await get(h, j);
+		for (const metric of Object.values(body.video)) {
+			expect(metric).toEqual({ p50: 11, p95: 20, max: 20 });
+		}
+		expect(body.audio.total).toEqual({ p50: 11, p95: 20, max: 1000 });
+		expect(body.audio.engine).toEqual({ p50: 10, p95: 19, max: 20 });
+		expect(body.audio.fetch).toEqual(body.audio.engine);
+		expect(body.duplicates).toBe(2);
+		expect(body.tasks).toEqual(original);
+		expect(j.taskStats).toEqual(original);
+	});
+
+	for (const [name, values, expected] of [
+		["empty", [], { p50: 0, p95: 0, max: 0 }],
+		["negative", [-3.6, -2.4, -1.6], { p50: -2, p95: -2, max: 0 }],
+		[
+			"missing and numeric strings",
+			[undefined, null, "2.6"],
+			{ p50: 0, p95: 3, max: 3 },
+		],
+		["NaN", [1, "invalid", 2], { p50: null, p95: 2, max: null }],
+		["infinity", [-Infinity, 1, Infinity], { p50: 1, p95: null, max: null }],
+	] as const) {
+		test(`query preserves ${name} values`, async () => {
+			const h = harness();
+			const j = job();
+			h.jobs.set(j.id, j);
+			j.taskStats = values.map((totalMs) => ({ kind: "video", totalMs }));
+			expect((await get(h, j)).video.total).toEqual(expected);
+		});
+	}
+
+	test("active queries see new samples and terminal queries keep the frozen metrics", async () => {
+		const h = harness();
+		const j = job();
+		h.jobs.set(j.id, j);
+		j.taskStats.push({ kind: "video", totalMs: 1 });
+		expect((await get(h, j)).video.total).toEqual({ p50: 1, p95: 1, max: 1 });
+		j.taskStats.push({ kind: "video", totalMs: 9 });
+		expect((await get(h, j)).video.total).toEqual({ p50: 9, p95: 9, max: 9 });
+		j.status = "ready";
+		h.finish(j);
+		const frozen = await get(h, j);
+		expect(j.taskStats).toEqual([]);
+		j.taskStats.push({ kind: "video", totalMs: 1000 });
+		j.verified = true;
+		expect(await get(h, j)).toEqual({ ...frozen, verified: true });
+	});
+});
+
 describe("transcodes", () => {
 	const request = {
 		sourceRoot: "owner/video/",
@@ -1038,52 +1310,105 @@ describe("transcodes", () => {
 		});
 	});
 
-	test("a fresh index can reuse a retained transcode after its raw upload is removed", async () => {
+	for (const scenario of ["retained", "created during preflight"]) {
+		test(`concurrent indexes reuse an output ${scenario} after its raw upload is removed`, async () => {
+			const h = harness();
+			const prefix = "owner/video/project";
+			const header = mp4.buildHeader({
+				width: 128,
+				height: 72,
+				fps: 30,
+				video: {
+					sizes: Uint32Array.of(1),
+					runs: [{ first: 0, count: 1, offset: 0 }],
+					keyframes: Uint32Array.of(0),
+					avcC: mp4.avcC(ANNEX_B_PARAMETER_SETS),
+				},
+				audio: null,
+				payloadSize: 1,
+				minimumSize: 0,
+			});
+			const output = new Uint8Array(header.byteLength + 1);
+			output.set(header);
+			if (scenario === "retained") h.objects.set(request.output, output);
+			else {
+				h.objects.set(request.source, new Uint8Array(100));
+				h.afterHead((key) => {
+					if (key !== request.source) return;
+					h.objects.set(request.output, output);
+					h.objects.delete(request.source);
+				});
+			}
+			const gate = Promise.withResolvers<void>();
+			h.gateHead(gate.promise);
+			const requests = Array.from({ length: 10 }, (_, index) => {
+				const recording = `${prefix}${index}`;
+				h.objects.set(
+					`${recording}/recording-meta.json`,
+					new TextEncoder().encode("{}"),
+				);
+				h.objects.set(
+					`${recording}/manifest.json`,
+					new TextEncoder().encode(
+						JSON.stringify({
+							files: [
+								{ path: "recording-meta.json", size: 2 },
+								{
+									path: "display.mp4",
+									key: request.output,
+									transcodeFrom: request.source,
+								},
+							],
+						}),
+					),
+				);
+				return h.sourceIndex(recording, request.sourceRoot);
+			});
+			const completed = Promise.all(requests);
+			try {
+				await Bun.sleep(0);
+				expect(h.heads).toEqual([request.output]);
+			} finally {
+				gate.resolve();
+			}
+			expect(await completed).toHaveLength(10);
+			expect(h.heads.filter((key) => key === request.output)).toHaveLength(2);
+			expect(h.heads.filter((key) => key === request.source)).toHaveLength(
+				scenario === "retained" ? 0 : 1,
+			);
+			expect(
+				await (await call(h, "/transcodes", request)).json(),
+			).toMatchObject({
+				status: "ready",
+				size: output.byteLength,
+			});
+		});
+	}
+
+	test("standalone transcodes share the bounded preflight reader", async () => {
 		const h = harness();
-		const prefix = "owner/video/project";
-		const header = mp4.buildHeader({
-			width: 128,
-			height: 72,
-			fps: 30,
-			video: {
-				sizes: Uint32Array.of(1),
-				runs: [{ first: 0, count: 1, offset: 0 }],
-				keyframes: Uint32Array.of(0),
-				avcC: mp4.avcC(ANNEX_B_PARAMETER_SETS),
-			},
-			audio: null,
-			payloadSize: 1,
-			minimumSize: 0,
+		const gate = Promise.withResolvers<void>();
+		h.gateHead(gate.promise);
+		const requests = Array.from({ length: 40 }, (_, index) => {
+			const source = `${request.source}${index}`;
+			h.objects.set(source, new Uint8Array(100));
+			return call(h, "/transcodes", {
+				...request,
+				source,
+				output: `${request.output}${index}.mp4`,
+			});
 		});
-		const output = new Uint8Array(header.byteLength + 1);
-		output.set(header);
-		h.objects.set(request.output, output);
-		h.objects.set(
-			`${prefix}/recording-meta.json`,
-			new TextEncoder().encode("{}"),
-		);
-		h.objects.set(
-			`${prefix}/manifest.json`,
-			new TextEncoder().encode(
-				JSON.stringify({
-					files: [
-						{ path: "recording-meta.json", size: 2 },
-						{
-							path: "display.mp4",
-							key: request.output,
-							transcodeFrom: request.source,
-						},
-					],
-				}),
-			),
-		);
-		await expect(
-			h.sourceIndex(prefix, request.sourceRoot),
-		).resolves.toBeDefined();
-		expect(await (await call(h, "/transcodes", request)).json()).toMatchObject({
-			status: "ready",
-			size: output.byteLength,
-		});
+		const completed = Promise.all(requests);
+		try {
+			await Bun.sleep(0);
+			expect(h.heads).toHaveLength(16);
+		} finally {
+			gate.resolve();
+		}
+		for (const response of await completed) {
+			expect(await response.json()).toMatchObject({ status: "queued" });
+		}
+		expect(h.heads).toHaveLength(80);
 	});
 
 	test("standalone transcodes reject missing and oversized raw sources before dispatch", async () => {
@@ -1146,120 +1471,268 @@ describe("transcodes", () => {
 	});
 });
 
-describe("jobs for the product", () => {
-	test("cached indexes must satisfy each job's source scope", async () => {
+describe("finished job resources", () => {
+	test("finished jobs close and release their local audio cache", async () => {
 		const h = harness();
-		const prefix = "owner/video/project";
-		h.objects.set(
-			`${prefix}/manifest.json`,
-			new TextEncoder().encode(
-				JSON.stringify({
-					files: [
-						{
-							path: "recording-meta.json",
-							key: "owner/other/recording-meta.json",
-							size: 2,
-						},
-					],
-				}),
-			),
+		const j = job();
+		j.status = "error";
+		const cache = new ProjectCache(
+			{
+				async getRange() {
+					return new Uint8Array();
+				},
+			},
+			"unused-audio-cache",
 		);
-		h.objects.set(
-			"owner/other/recording-meta.json",
-			new TextEncoder().encode("{}"),
-		);
-		const cached = await h.sourceIndex(prefix, "owner/");
-		expect(await h.sourceIndex(prefix, "owner/")).toBe(cached);
-		await expect(h.sourceIndex(prefix, "owner/video/")).rejects.toThrow(
-			"outside the recording",
-		);
-		await expect(h.sourceIndex(prefix)).rejects.toThrow(
-			"outside the recording",
+		j.audioCache = cache;
+		h.finish(j);
+		expect(j.audioCache).toBeUndefined();
+		await expect(cache.materialize([])).rejects.toThrow(
+			"Project cache is closed",
 		);
 	});
 
-	test("a new project folder reuses an unchanged source's moov", async () => {
+	test("late task reports retain validation after download plans are released", async () => {
 		const h = harness();
-		const source = "owner/video/display.mp4";
-		// Cap's recorder writes the moov after the media, past the head the
-		// index reads first.
-		const fileOf = (frames: number) => {
-			const header = mp4.buildHeader({
-				width: 128,
-				height: 72,
-				fps: 30,
-				video: {
-					sizes: new Uint32Array(frames).fill(1),
-					runs: [{ first: 0, count: frames, offset: 0 }],
-					keyframes: Uint32Array.of(0),
-					avcC: mp4.avcC(ANNEX_B_PARAMETER_SETS),
-				},
-				audio: null,
-				payloadSize: frames,
-				minimumSize: 0,
+		const j = job();
+		j.status = "ready";
+		j.hls = await h.newHlsState("hls/job");
+		j.hls.ended = true;
+		const state = videoState(j);
+		state.firstPart = 13;
+		h.jobs.set(j.id, j);
+		h.finish(j);
+		const report: protocol.SegmentReport = {
+			chunk: 0,
+			index: 0,
+			frames: [0, 30],
+			key: "hls/job/c0-p13-0.m4s",
+			last: true,
+			extradata: "",
+		};
+		const send = (suffix: string, body: unknown) =>
+			h.fetch(
+				new Request(`http://test/tasks/${state.task.taskId}/${suffix}`, {
+					method: "POST",
+					headers: {
+						authorization: "Bearer test",
+						"content-type": "application/json",
+					},
+					body: JSON.stringify(body),
+				}),
+			);
+		expect((await send("segment", report)).status).toBe(200);
+		expect(
+			(await send("segment", { ...report, key: "foreign/segment.m4s" })).status,
+		).toBe(400);
+		expect((await send("done", result(state))).status).toBe(200);
+		expect(
+			(
+				await send("fail", {
+					worker: "worker-a",
+					attempt: state.attempts,
+					error: "late failure",
+				})
+			).status,
+		).toBe(200);
+		expect(j.status).toBe("ready");
+		expect(state.task.files).toEqual([]);
+	});
+
+	for (const status of ["ready", "error"] as const) {
+		test(`${status} jobs release download plans and retain worker cancellation metadata`, async () => {
+			const h = harness();
+			const j = job();
+			j.status = status;
+			j.t[status === "ready" ? "ready" : "failed"] = Date.now();
+			j.chunks[0]?.files.push({
+				path: "display.mp4",
+				key: "source/display.mp4",
+				size: 1024,
+				ranges: [[0, 512]],
 			});
-			const at = mp4.locateMoov(header, header.byteLength) as {
-				start: number;
-				size: number;
+			const running = videoState(j);
+			running.task.files = j.chunks[0]?.files ?? [];
+			const payloadFiles = running.task.files;
+			const queued: TaskState = {
+				...running,
+				state: "queued",
+				task: { ...running.task, taskId: "job:v1" },
 			};
-			const mdat = 2 * 1024 * 1024;
-			const bytes = new Uint8Array(mdat + at.size);
-			new DataView(bytes.buffer).setUint32(0, mdat);
-			bytes.set(new TextEncoder().encode("mdat"), 4);
-			bytes.set(header.subarray(at.start, at.start + at.size), mdat);
-			return bytes;
-		};
-		let folder = 0;
-		const indexOf = async (bytes: Uint8Array) => {
-			h.objects.set(source, bytes);
-			const prefix = `owner/video/.recording/render/${folder++}/project`;
-			h.objects.set(
-				`${prefix}/recording-meta.json`,
-				new TextEncoder().encode("{}"),
+			j.tasks.set(queued.task.taskId, queued);
+			h.queue.push(queued);
+			h.jobs.set(j.id, j);
+			h.finish(j);
+			expect(j.chunks).toHaveLength(2);
+			expect(j.chunks[0]?.frames).toEqual([0, 30]);
+			expect(j.chunks[0]?.files).toEqual([]);
+			expect(running.task.files).toEqual([]);
+			expect(payloadFiles).toHaveLength(1);
+			expect(j.tasks.has(queued.task.taskId)).toBe(false);
+			expect(h.queue).toEqual([]);
+			const heartbeatResponse = await h.fetch(
+				heartbeat("worker-a", running.task.taskId, running.attempts),
 			);
-			h.objects.set(
-				`${prefix}/manifest.json`,
-				new TextEncoder().encode(
-					JSON.stringify({
-						files: [
-							{ path: "recording-meta.json", size: 2 },
-							{ path: "display.mp4", key: source, size: bytes.byteLength },
-						],
-					}),
-				),
+			expect(
+				((await heartbeatResponse.json()) as { cancel: string[] }).cancel,
+			).toContain(running.task.taskId);
+			j.verified = false;
+			const response = await h.fetch(
+				new Request("http://test/jobs/job", {
+					headers: { authorization: "Bearer test" },
+				}),
 			);
-			const before = h.ranges.filter((range) =>
-				range.startsWith(`${source}:`),
-			).length;
-			const index = (await h.sourceIndex(prefix, "owner/video/")) as {
-				mediaMeta: Map<
-					string,
-					{ moov: [number, number]; index: { sizes: Uint32Array } }
-				>;
+			const body = (await response.json()) as {
+				status: string;
+				output: { frames: number };
+				verified: boolean;
 			};
-			const meta = index.mediaMeta.get("display.mp4");
-			return {
-				frames: meta?.index.sizes.length,
-				moov: meta?.moov,
-				reads:
-					h.ranges.filter((range) => range.startsWith(`${source}:`)).length -
-					before,
-			};
+			expect(response.status).toBe(200);
+			expect(body.status).toBe(status);
+			expect(body.output.frames).toBe(j.totalFrames);
+			expect(body.verified).toBe(false);
+		});
+	}
+
+	test("audio task download plans are released without changing the dispatched payload", () => {
+		const h = harness();
+		const j = job();
+		j.status = "error";
+		const files: protocol.AudioTask["files"] = [
+			{ path: "mic.ogg", key: "source/mic.ogg", size: 100, ranges: "all" },
+		];
+		const task: protocol.AudioTask = {
+			kind: "audio",
+			taskId: "job:a0",
+			jobId: j.id,
+			section: 0,
+			fps: 30,
+			range: [0, 30],
+			preroll: 0,
+			files,
 		};
-
-		const small = fileOf(3);
-		expect(await indexOf(small)).toEqual({
-			frames: 3,
-			moov: [2 * 1024 * 1024, small.byteLength],
-			reads: 2,
+		j.tasks.set(task.taskId, {
+			task,
+			state: "running",
+			worker: "worker-a",
+			attempts: 1,
 		});
-		expect(await indexOf(small)).toMatchObject({ frames: 3, reads: 1 });
+		h.finish(j);
+		expect(task.files).toEqual([]);
+		expect(files).toHaveLength(1);
+		expect(task.range).toEqual([0, 30]);
+	});
+});
 
-		const replaced = fileOf(300_000);
-		expect(await indexOf(replaced)).toMatchObject({
-			frames: 300_000,
-			reads: 2,
+describe("dispatch scheduling", () => {
+	for (const status of ["planning", "assembling", "ready", "error"] as const) {
+		test(`retained ${status} jobs are not scanned for scheduling data`, () => {
+			const h = harness();
+			let scans = 0;
+			class RetainedTasks extends Map<string, TaskState> {
+				override values() {
+					scans++;
+					return super.values();
+				}
+			}
+			const inactive = job();
+			inactive.id = "inactive";
+			inactive.status = status;
+			inactive.tasks = new RetainedTasks();
+			const stale = videoState(inactive);
+			stale.state = "queued";
+			const active = job();
+			active.id = "active";
+			const wanted = videoState(active);
+			wanted.state = "queued";
+			h.jobs.set(inactive.id, inactive);
+			h.jobs.set(active.id, active);
+			h.queue.push(stale, wanted);
+			expect(h.pickQueued(() => true)).toBe(1);
+			expect(scans).toBe(0);
+			expect(h.jobs.size).toBe(2);
 		});
+	}
+
+	test("accepted queued copies are retired before the scheduling snapshot", () => {
+		const h = harness();
+		const active = job();
+		const stale = videoState(active);
+		stale.state = "queued";
+		if (stale.task.kind !== "video") throw new Error("expected video task");
+		const fresh: TaskState = {
+			...stale,
+			task: { ...stale.task, taskId: "job:v1", kind: "video", chunk: 1 },
+		};
+		active.tasks.set(fresh.task.taskId, fresh);
+		active.videoResults.set(0, result(stale));
+		h.jobs.set(active.id, active);
+		h.queue.push(stale, fresh);
+		expect(h.pickQueued(() => true)).toBe(0);
+		expect(stale).toMatchObject({ state: "done" });
+		expect(h.queue).toEqual([fresh]);
+	});
+
+	test("active job load remains part of scheduling fairness", () => {
+		const h = harness();
+		const busy = job();
+		busy.id = "busy";
+		busy.t.requested = 0;
+		const busyQueued = videoState(busy);
+		busyQueued.state = "queued";
+		busy.tasks.set("running", { ...busyQueued, state: "running" });
+		const idle = job();
+		idle.id = "idle";
+		idle.t.requested = 500;
+		const idleQueued = videoState(idle);
+		idleQueued.state = "queued";
+		h.jobs.set(busy.id, busy);
+		h.jobs.set(idle.id, idle);
+		h.queue.push(busyQueued, idleQueued);
+		expect(h.pickQueued(() => true)).toBe(1);
+	});
+
+	test("fifo scheduling still skips retained inactive jobs", () => {
+		const h = harness({ RF_SCHEDULER: "fifo" });
+		const retained = job();
+		retained.id = "retained";
+		retained.status = "ready";
+		const inactive = videoState(retained);
+		inactive.state = "queued";
+		const active = job();
+		const first = videoState(active);
+		first.state = "queued";
+		h.jobs.set(retained.id, retained);
+		h.jobs.set(active.id, active);
+		h.queue.push(inactive, first);
+		expect(h.pickQueued(() => true)).toBe(1);
+	});
+});
+
+describe("jobs for the product", () => {
+	test("concurrent index warmups share source reads through the request handler", async () => {
+		const h = harness();
+		const prefix = "owner/video/project";
+		h.objects.set(
+			`${prefix}/recording-meta.json`,
+			new TextEncoder().encode("{}"),
+		);
+		h.objects.set(
+			`${prefix}/manifest.json`,
+			new TextEncoder().encode(
+				JSON.stringify({ files: [{ path: "recording-meta.json", size: 2 }] }),
+			),
+		);
+		const responses = await Promise.all(
+			Array.from({ length: 10 }, () =>
+				call(h, "/index", { recording: prefix }),
+			),
+		);
+		expect(responses.every((response) => response.status === 200)).toBe(true);
+		expect(h.ranges).toEqual([
+			`${prefix}/manifest.json:0`,
+			`${prefix}/recording-meta.json:0`,
+		]);
 	});
 
 	test("write to the requested keys and call back signed when finished", async () => {

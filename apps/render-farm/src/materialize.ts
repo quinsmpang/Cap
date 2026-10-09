@@ -7,7 +7,8 @@ import {
 	writeFileSync,
 	writeSync,
 } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
+import { ConcurrencyLimiter } from "./concurrency-limiter";
 import type { S3 } from "./s3";
 
 // Recreates a recording on local disk with only the bytes a task needs.
@@ -29,44 +30,45 @@ const PIECE = 4 << 20;
 
 type LocalFile = {
 	fd: number;
-	pieces: Map<number, Promise<void>>;
+	pieces: Map<number, Promise<void> | null>;
 };
-
-class Limiter {
-	private active = 0;
-	private queue: (() => void)[] = [];
-	constructor(private limit: number) {}
-	async run<T>(fn: () => Promise<T>): Promise<T> {
-		if (this.active >= this.limit) {
-			await new Promise<void>((resolve) => this.queue.push(resolve));
-		}
-		this.active++;
-		try {
-			return await fn();
-		} finally {
-			this.active--;
-			this.queue.shift()?.();
-		}
-	}
-}
 
 export type FetchStats = { bytes: number; requests: number; ms: number };
 
 export class ProjectCache {
 	private files = new Map<string, LocalFile>();
+	private filesByPath = new Map<string, LocalFile>();
+	private readonly cacheFilePaths: boolean;
+	private closed = false;
 	private rewritten = false;
-	private limiter: Limiter;
+	private readonly limiter: ConcurrencyLimiter;
 	bytesFetched = 0;
 
 	constructor(
-		readonly s3: S3,
+		readonly s3: Pick<S3, "getRange">,
 		readonly root: string,
 		concurrency = Number(process.env.RF_FETCH_CONCURRENCY ?? 12),
 	) {
-		this.limiter = new Limiter(concurrency);
+		this.cacheFilePaths =
+			isAbsolute(root) &&
+			(process.platform !== "win32" || parse(root).root.length > 1);
+		const limit =
+			Number.isFinite(concurrency) && concurrency > 0
+				? Math.max(1, Math.floor(concurrency))
+				: 12;
+		this.limiter = new ConcurrencyLimiter(limit);
+	}
+
+	private assertOpen() {
+		if (this.closed) throw new Error("Project cache is closed");
 	}
 
 	private open(spec: FileSpec) {
+		this.assertOpen();
+		const cached = this.cacheFilePaths
+			? this.filesByPath.get(spec.path)
+			: undefined;
+		if (cached) return cached;
 		const fullPath = resolve(this.root, spec.path);
 		if (!fullPath.startsWith(resolve(this.root) + sep)) {
 			throw new Error(`${spec.path} is outside the project`);
@@ -75,10 +77,16 @@ export class ProjectCache {
 		if (!file) {
 			mkdirSync(dirname(fullPath), { recursive: true });
 			const fd = openSync(fullPath, "w+");
-			ftruncateSync(fd, spec.size);
+			try {
+				ftruncateSync(fd, spec.size);
+			} catch (error) {
+				closeSync(fd);
+				throw error;
+			}
 			file = { fd, pieces: new Map() };
 			this.files.set(fullPath, file);
 		}
+		if (this.cacheFilePaths) this.filesByPath.set(spec.path, file);
 		return file;
 	}
 
@@ -89,30 +97,37 @@ export class ProjectCache {
 		stats: FetchStats,
 	) {
 		let pending = file.pieces.get(piece);
+		if (pending === null) return;
 		if (!pending) {
 			const start = piece * PIECE;
 			const end = Math.min(spec.size, start + PIECE);
-			pending = this.limiter.run(async () => {
-				const bytes = await this.s3.getRange(spec.key, start, end - 1);
-				if (bytes.byteLength !== end - start) {
-					throw new Error(
-						`short read ${spec.key} ${start}-${end}: ${bytes.byteLength}`,
-					);
-				}
-				let written = 0;
-				while (written < bytes.byteLength) {
-					written += writeSync(
-						file.fd,
-						bytes,
-						written,
-						bytes.byteLength - written,
-						start + written,
-					);
-				}
-				this.bytesFetched += bytes.byteLength;
-				stats.bytes += bytes.byteLength;
-				stats.requests++;
-			});
+			pending = this.limiter
+				.run(async () => {
+					this.assertOpen();
+					const bytes = await this.s3.getRange(spec.key, start, end - 1);
+					this.assertOpen();
+					if (bytes.byteLength !== end - start) {
+						throw new Error(
+							`short read ${spec.key} ${start}-${end}: ${bytes.byteLength}`,
+						);
+					}
+					let written = 0;
+					while (written < bytes.byteLength) {
+						written += writeSync(
+							file.fd,
+							bytes,
+							written,
+							bytes.byteLength - written,
+							start + written,
+						);
+					}
+					this.bytesFetched += bytes.byteLength;
+					stats.bytes += bytes.byteLength;
+					stats.requests++;
+				})
+				.then(() => {
+					file.pieces.set(piece, null);
+				});
 			pending.catch(() => file.pieces.delete(piece));
 			file.pieces.set(piece, pending);
 		}
@@ -120,6 +135,7 @@ export class ProjectCache {
 	}
 
 	async materialize(specs: FileSpec[]): Promise<FetchStats> {
+		this.assertOpen();
 		const started = performance.now();
 		const stats: FetchStats = { bytes: 0, requests: 0, ms: 0 };
 		const work: Promise<void>[] = [];
@@ -143,10 +159,13 @@ export class ProjectCache {
 					pieces.add(piece);
 				}
 			}
-			for (const piece of pieces)
-				work.push(this.fetchPiece(spec, file, piece, stats));
+			for (const piece of pieces) {
+				const pending = this.fetchPiece(spec, file, piece, stats);
+				if (pending) work.push(pending);
+			}
 		}
 		await Promise.all(work);
+		this.assertOpen();
 		if (
 			!this.rewritten &&
 			specs.some((spec) => spec.path === "project-config.json")
@@ -163,11 +182,13 @@ export class ProjectCache {
 	}
 
 	close() {
+		this.closed = true;
 		for (const file of this.files.values()) {
 			try {
 				closeSync(file.fd);
 			} catch {}
 		}
 		this.files.clear();
+		this.filesByPath.clear();
 	}
 }

@@ -6,19 +6,12 @@ import {
 } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { ConcurrencyLimiter } from "./concurrency-limiter";
 import { Engine } from "./engine";
 import { initSegment, playlist } from "./fmp4";
 import { checkSegmentReport, segmentCuts, segmentKey } from "./hls";
 import { type FileSpec, ProjectCache } from "./materialize";
-import {
-	avcC,
-	buildHeader,
-	byteRangeFor,
-	indexVideoTrack,
-	locateMoov,
-	type Run,
-	type TrackIndex,
-} from "./mp4";
+import { avcC, buildHeader, byteRangeFor, type Run } from "./mp4";
 import {
 	chunkPartLayout,
 	MIN_RANGE_PARTS,
@@ -42,14 +35,21 @@ import { acceptOnce, completeUpload, reservePartRange } from "./recovery";
 import { mediaS3ConfigFromEnv, S3, s3ConfigFromEnv } from "./s3";
 import { pickQueued as pickQueuedTask } from "./scheduler";
 import {
+	type Manifest,
+	type RecordingMeta,
+	type SourceIndex,
+	SourceIndexes,
+} from "./source-index";
+import {
 	planStitch,
 	StitchLimiter,
 	type StitchPart,
+	StitchPlanner,
 	uploadProblem,
 } from "./stitch";
+import { TranscodeInputs } from "./transcode-inputs";
 import {
 	AUDIO_FILE,
-	checkManifestBounds,
 	isKey,
 	sourceLimitsFromEnv,
 	validateJobRequest,
@@ -59,6 +59,7 @@ import {
 // own); the journal stays in the render farm's bucket.
 const s3 = new S3(mediaS3ConfigFromEnv());
 const journalS3 = new S3(s3ConfigFromEnv());
+const stashDeletes = new ConcurrencyLimiter(16);
 const ENGINE_BIN = process.env.RF_ENGINE_BIN ?? "cap-render-farm";
 const WORK_DIR = process.env.RF_WORK_DIR ?? "/tmp/rf-coordinator";
 const PORT = Number(process.env.PORT ?? 8080);
@@ -299,6 +300,14 @@ type Job = {
 	acceptances: Map<string, Promise<void>>;
 	stitchParts?: Map<string, Promise<{ partNumber: number; etag: string }>>;
 	headerStashes?: Map<string, Promise<Uint8Array>>;
+	stitchPlan?: {
+		planner: StitchPlanner;
+		nextChunk: number;
+		headerPending: boolean;
+		lastPart?: StitchPart;
+		retryReads: Set<string>;
+		retryParts: Map<string, StitchPart>;
+	};
 	/** Summary frozen when the job ends; the job's media data is released then. */
 	final?: ReturnType<typeof summary>;
 	hls?: HlsState;
@@ -406,123 +415,18 @@ async function newJob(
 
 // ---------------------------------------------------------------- planning ---
 
-type Manifest = {
-	files: {
-		path: string;
-		size: number;
-		key?: string;
-		/** Transcode this source to `key` first (see TranscodeTask). */
-		transcodeFrom?: string;
-	}[];
-};
-
-type RecordingMeta = {
-	segments?: {
-		display: { path: string; start_time?: number };
-		camera?: { path: string; start_time?: number };
-		mic?: { path: string };
-		system_audio?: { path: string };
-	}[];
-	display?: { path: string };
-	camera?: { path: string };
-	audio?: { path: string };
-};
-
-type Mp4Meta = {
-	head: [number, number];
-	moov: [number, number];
-	index: ReturnType<typeof indexVideoTrack>;
-};
-
-// Every web Save renders from a new project folder, so the per-recording
-// source index never hits; the parsed moov of an unchanged source file can.
-const mp4Metas = new Map<string, Mp4Meta>();
-const MP4_META_CACHE_ENTRIES = 16;
-// A manifest can list thousands of videos; their index reads share this many
-// slots across every job so one can't flood storage or the coordinator.
-const INDEX_READ_CONCURRENCY = Math.max(
-	1,
-	Math.floor(Number(process.env.RF_INDEX_READ_CONCURRENCY)) || 16,
+const SOURCE_LIMITS = sourceLimitsFromEnv(process.env);
+const transcodeInputs = new TranscodeInputs(s3, SOURCE_LIMITS.sourceBytes);
+const sourceIndexes = new SourceIndexes(
+	s3,
+	{
+		storedSize: (output) => transcodeInputs.storedSize(output),
+		sourceSize: (source) => transcodeInputs.sourceSize(source),
+		run: async (source, output) =>
+			awaitTranscode(await ensureTranscode(source, output)),
+	},
+	process.env,
 );
-let indexReadsActive = 0;
-const indexReadQueue: (() => void)[] = [];
-
-async function withIndexRead<T>(run: () => Promise<T>): Promise<T> {
-	if (indexReadsActive < INDEX_READ_CONCURRENCY) indexReadsActive++;
-	else await new Promise<void>((resolve) => indexReadQueue.push(resolve));
-	try {
-		return await run();
-	} finally {
-		const next = indexReadQueue.shift();
-		if (next) next();
-		else indexReadsActive--;
-	}
-}
-
-async function mp4MetaRanges(key: string, size: number): Promise<Mp4Meta> {
-	const headEnd = Math.min(size, 128 * 1024);
-	const { bytes: head, etag } = await s3.getRangeTagged(key, 0, headEnd - 1);
-	const cacheKey =
-		etag && process.env.RF_INDEX_CACHE !== "0"
-			? `${key}\n${size}\n${etag}`
-			: null;
-	const cached = cacheKey ? mp4Metas.get(cacheKey) : undefined;
-	if (cacheKey && cached) {
-		mp4Metas.delete(cacheKey);
-		mp4Metas.set(cacheKey, cached);
-		return cached;
-	}
-	const meta = await readMp4Meta(key, size, head);
-	if (cacheKey) {
-		mp4Metas.set(cacheKey, meta);
-		if (mp4Metas.size > MP4_META_CACHE_ENTRIES)
-			mp4Metas.delete(mp4Metas.keys().next().value as string);
-	}
-	return meta;
-}
-
-async function readMp4Meta(
-	key: string,
-	size: number,
-	head: Uint8Array,
-): Promise<Mp4Meta> {
-	const location = locateMoov(head, size);
-	let moovStart: number;
-	let moovBytes: Uint8Array;
-	if (location && "start" in location && location.start !== undefined) {
-		if (location.size > SOURCE_LIMITS.moovBytes) {
-			throw new Error(`${key} has a ${location.size} byte moov`);
-		}
-		moovStart = location.start;
-		moovBytes =
-			location.start + location.size <= head.byteLength
-				? head.subarray(location.start, location.start + location.size)
-				: await s3.getRange(
-						key,
-						location.start,
-						location.start + location.size - 1,
-					);
-	} else if (location && "next" in location && location.next !== undefined) {
-		// Moov after mdat (Cap's recorder): fetch the tail in one request.
-		if (size - location.next > SOURCE_LIMITS.moovBytes) {
-			throw new Error(`${key} has ${size - location.next} bytes after mdat`);
-		}
-		const tail = await s3.getRange(key, location.next, size - 1);
-		const found = locateMoov(tail, tail.byteLength);
-		if (!found || !("start" in found) || found.start === undefined) {
-			throw new Error(`no moov in ${key}`);
-		}
-		moovStart = location.next + found.start;
-		moovBytes = tail.subarray(found.start, found.start + found.size);
-	} else {
-		throw new Error(`no moov in ${key}`);
-	}
-	return {
-		head: [0, Math.min(size, 128 * 1024)],
-		moov: [moovStart, moovStart + moovBytes.byteLength],
-		index: indexVideoTrack(moovBytes),
-	};
-}
 
 function mergeRanges(ranges: [number, number][]) {
 	const sorted = ranges
@@ -536,149 +440,6 @@ function mergeRanges(ranges: [number, number][]) {
 		else merged.push([range[0], range[1]]);
 	}
 	return merged;
-}
-
-type SourceIndex = {
-	manifest: Manifest;
-	recordingMeta: RecordingMeta;
-	mediaMeta: Map<
-		string,
-		{
-			head: [number, number];
-			moov: [number, number];
-			index: TrackIndex;
-			size: number;
-			key: string;
-		}
-	>;
-};
-// Stand-in for an index built once at upload time: recordings are immutable
-// once uploaded, so their moov indexes never need re-reading per export.
-const sourceIndexes = new Map<string, SourceIndex>();
-
-// Shared prefixes a manifest may point sources at besides its own recording
-// prefix (e.g. assets reused across recordings), comma-separated.
-const SOURCE_KEY_PREFIXES = (process.env.RF_SOURCE_KEY_PREFIXES ?? "")
-	.split(",")
-	.filter(Boolean);
-
-const SOURCE_LIMITS = sourceLimitsFromEnv(process.env);
-
-async function getBounded(key: string, limit: number) {
-	const bytes = await s3.getRange(key, 0, limit);
-	if (bytes.byteLength > limit) {
-		throw new Error(`${key} is larger than ${limit} bytes`);
-	}
-	return bytes;
-}
-
-/** Manifests name local paths and bucket keys; neither may escape its scope. */
-function checkManifest(
-	manifest: Manifest,
-	prefix: string,
-	sourceRoot?: string,
-) {
-	const bounds = checkManifestBounds(manifest, SOURCE_LIMITS);
-	if (bounds) throw new Error(bounds);
-	for (const file of manifest.files) {
-		const parts = file.path.split("/");
-		if (
-			file.path.startsWith("/") ||
-			parts.includes("..") ||
-			parts.includes("")
-		) {
-			throw new Error(`manifest path ${file.path} is not a relative path`);
-		}
-		const inScope = (key: string) =>
-			key.startsWith(`${prefix}/`) ||
-			(sourceRoot !== undefined && key.startsWith(sourceRoot)) ||
-			SOURCE_KEY_PREFIXES.some((allowed) => key.startsWith(allowed));
-		for (const key of [file.key, file.transcodeFrom]) {
-			if (key !== undefined && (!isKey(key) || !inScope(key))) {
-				throw new Error(
-					`manifest key for ${file.path} is outside the recording`,
-				);
-			}
-		}
-		if (file.transcodeFrom !== undefined && file.key === undefined) {
-			throw new Error(`manifest transcode for ${file.path} names no key`);
-		}
-	}
-}
-
-async function sourceIndex(
-	prefix: string,
-	sourceRoot?: string,
-	onManifest?: (manifest: Manifest) => void,
-): Promise<SourceIndex> {
-	const cached =
-		process.env.RF_INDEX_CACHE !== "0" ? sourceIndexes.get(prefix) : undefined;
-	if (cached) {
-		checkManifest(cached.manifest, prefix, sourceRoot);
-		onManifest?.(cached.manifest);
-		return cached;
-	}
-	const manifest = JSON.parse(
-		new TextDecoder().decode(
-			await getBounded(`${prefix}/manifest.json`, SOURCE_LIMITS.metadataBytes),
-		),
-	) as Manifest;
-	checkManifest(manifest, prefix, sourceRoot);
-	onManifest?.(manifest);
-	const keyOf = (file: { path: string; key?: string }) =>
-		file.key ?? `${prefix}/${file.path}`;
-	const sourceFiles = await Promise.all(
-		manifest.files.map(async (file) => ({
-			...file,
-			size:
-				file.transcodeFrom === undefined
-					? file.size
-					: ((await storedTranscodeSize(keyOf(file))) ??
-						(await transcodeSourceSize(file.transcodeFrom))),
-		})),
-	);
-	const sourceBounds = checkManifestBounds(
-		{ files: sourceFiles },
-		SOURCE_LIMITS,
-	);
-	if (sourceBounds) throw new Error(sourceBounds);
-	await Promise.all(
-		manifest.files.map(async (file) => {
-			if (file.transcodeFrom === undefined) return;
-			file.size = await awaitTranscode(
-				await ensureTranscode(file.transcodeFrom, keyOf(file)),
-			);
-		}),
-	);
-	const bounds = checkManifestBounds(manifest, SOURCE_LIMITS);
-	if (bounds) throw new Error(bounds);
-	const metaFile = manifest.files.find(
-		(file) => file.path === "recording-meta.json",
-	);
-	if (!metaFile) throw new Error("recording has no recording-meta.json");
-	const mediaMeta: SourceIndex["mediaMeta"] = new Map();
-	const [recordingMeta] = await Promise.all([
-		getBounded(keyOf(metaFile), SOURCE_LIMITS.metadataBytes).then(
-			(bytes) => JSON.parse(new TextDecoder().decode(bytes)) as RecordingMeta,
-		),
-		...manifest.files
-			.filter((file) => file.path.endsWith(".mp4"))
-			.map(async (file) => {
-				const meta = await withIndexRead(() =>
-					mp4MetaRanges(keyOf(file), file.size),
-				);
-				mediaMeta.set(file.path, {
-					...meta,
-					size: file.size,
-					key: keyOf(file),
-				});
-			}),
-	]);
-	const index = { manifest, recordingMeta, mediaMeta };
-	sourceIndexes.set(prefix, index);
-	if (sourceIndexes.size > 32)
-		sourceIndexes.delete(sourceIndexes.keys().next().value as string);
-	return index;
 }
 
 function manifestFiles(manifest: Manifest) {
@@ -736,7 +497,7 @@ async function planJob(job: Job) {
 	let baseFetch = null as Promise<unknown> | null;
 	let index: SourceIndex;
 	try {
-		index = await sourceIndex(prefix, request.sourceRoot, (manifest) => {
+		index = await sourceIndexes.get(prefix, request.sourceRoot, (manifest) => {
 			baseFetch = cache.materialize(baseFileSpecs(manifest, prefix, "probe"));
 			baseFetch.catch(() => {});
 		});
@@ -1461,20 +1222,22 @@ function pickQueued(accepts: (kind: string) => boolean) {
 		const job = jobs.get(state.task.jobId);
 		if (job && taskAccepted(job, state.task)) retireTask(state);
 	}
-	const schedulable = [...jobs.values()].map((job) => {
-		let runningTasks = 0;
-		for (const state of job.tasks.values()) {
-			if (state.state === "running") runningTasks++;
-		}
-		return {
-			id: job.id,
-			status: job.status,
-			requestedAt: job.t.requested ?? 0,
-			chunks: job.chunks.map((chunk) => chunk.index),
-			finishedChunks: job.videoResults,
-			runningTasks,
-		};
-	});
+	const schedulable = [...jobs.values()]
+		.filter((job) => job.status === "rendering")
+		.map((job) => {
+			let runningTasks = 0;
+			for (const state of job.tasks.values()) {
+				if (state.state === "running") runningTasks++;
+			}
+			return {
+				id: job.id,
+				status: job.status,
+				requestedAt: job.t.requested ?? 0,
+				chunks: job.chunks.map((chunk) => chunk.index),
+				finishedChunks: job.videoResults,
+				runningTasks,
+			};
+		});
 	return pickQueuedTask(queue, schedulable, accepts, {
 		headChunks: HEAD_CHUNKS,
 		fifo: process.env.RF_SCHEDULER === "fifo",
@@ -1571,34 +1334,6 @@ type Transcode = {
 /** By output key: one transcode per target, shared by every job needing it. */
 const transcodes = new Map<string, Transcode>();
 
-async function storedTranscodeSize(output: string) {
-	const head = await s3.head(output);
-	if (!head) return null;
-	if (
-		!Number.isSafeInteger(head.size) ||
-		head.size <= 0 ||
-		head.size > SOURCE_LIMITS.sourceBytes
-	) {
-		throw new Error("stored transcode output has an invalid size");
-	}
-	return head.size;
-}
-
-async function transcodeSourceSize(source: string) {
-	const head = await s3.head(source);
-	if (!head || !Number.isSafeInteger(head.size) || head.size <= 0) {
-		throw new Error(
-			`transcode source ${source} is missing or has an invalid size`,
-		);
-	}
-	if (head.size > SOURCE_LIMITS.sourceBytes) {
-		throw new Error(
-			`transcode source ${source} is ${head.size} bytes (limit ${SOURCE_LIMITS.sourceBytes})`,
-		);
-	}
-	return head.size;
-}
-
 async function ensureTranscode(source: string, output: string) {
 	const existing = transcodes.get(output);
 	if (existing && existing.state !== "error") return existing;
@@ -1620,11 +1355,11 @@ async function ensureTranscode(source: string, output: string) {
 	};
 	transcodes.set(output, transcode);
 	try {
-		const size = await storedTranscodeSize(output);
+		const size = await transcodeInputs.storedSize(output);
 		if (size !== null) {
 			settleTranscode(transcode, "ready", size);
 		} else {
-			await transcodeSourceSize(source);
+			await transcodeInputs.sourceSize(source);
 			transcode.state = "queued";
 			dispatch();
 		}
@@ -2133,17 +1868,20 @@ function finish(job: Job) {
 	if (job.status === "error" || !job.hls || job.hls.ended) persistFinished(job);
 	notify(job);
 	job.audioCache?.close();
+	job.audioCache = undefined;
 	// Freeze the summary, then drop the media: rendered audio alone is ~290 MB
 	// for a 2 h export, and finished jobs were never evicted.
 	job.final = summary(job);
 	job.audioSections.clear();
 	job.videoResults.clear();
 	job.taskStats = [];
+	for (const chunk of job.chunks) chunk.files = [];
 	for (const [taskId, state] of job.tasks) {
 		const index = queue.indexOf(state);
 		if (index >= 0) queue.splice(index, 1);
 		// Running copies stay so their workers are told to cancel them.
 		if (state.state !== "running") job.tasks.delete(taskId);
+		else state.task.files = [];
 	}
 	setTimeout(() => jobs.delete(job.id), JOB_RETENTION_MS).unref();
 	for (const waiter of job.waiters.splice(0)) waiter();
@@ -2154,6 +1892,7 @@ function finish(job: Job) {
 	stitchLimiter.cancel(job.id);
 	job.headerStashes = undefined;
 	job.stitchParts = undefined;
+	job.stitchPlan = undefined;
 	dropStashes(job.id).catch((error) =>
 		console.error(`job ${job.id}: stash cleanup failed: ${error}`),
 	);
@@ -2494,34 +2233,64 @@ async function writeStitchPart(
  */
 function stitchAhead(job: Job) {
 	if (!job.uploadId) return;
-	const accepted: Parameters<typeof planStitch>[1] = [];
-	for (const chunk of job.chunks) {
-		const result = job.videoResults.get(chunk.index);
-		if (!result) break;
-		accepted.push({
+	const first = job.chunks[0];
+	if (!job.stitchPlan && (!first || !job.videoResults.has(first.index))) return;
+	job.stitchPlan ??= {
+		planner: new StitchPlanner(0),
+		nextChunk: 0,
+		headerPending: true,
+		retryReads: new Set(),
+		retryParts: new Map(),
+	};
+	const state = job.stitchPlan;
+	// The header's part is the one assembly must write; read its stashes now
+	// so that write is only an upload.
+	job.headerStashes ??= new Map();
+	const readHeader = (key: string) => {
+		if (job.headerStashes?.has(key)) return;
+		state.retryReads.delete(key);
+		const read = stitchLimiter.run(job.id, true, () => journalS3.get(key));
+		read.catch(() => {
+			if (job.stitchPlan !== state) return;
+			job.headerStashes?.delete(key);
+			state.retryReads.add(key);
+		});
+		job.headerStashes?.set(key, read);
+	};
+	for (const key of state.retryReads) readHeader(key);
+	const plan = [...state.retryParts.values()];
+	state.retryParts.clear();
+	while (state.nextChunk < job.chunks.length) {
+		const chunk = job.chunks[state.nextChunk];
+		const result = chunk && job.videoResults.get(chunk.index);
+		if (!chunk || !result) break;
+		if (state.headerPending) readHeader(result.stash.key);
+		const part = state.planner.append({
 			slot: chunk.firstPart - 1,
 			stash: result.stash,
 			parts: result.parts,
 		});
-	}
-	if (accepted.length === 0) return;
-	// The header's part is the one assembly must write; read its stashes now
-	// so that write is only an upload.
-	job.headerStashes ??= new Map();
-	let carried = 0;
-	for (const chunk of accepted) {
-		if (!job.headerStashes.has(chunk.stash.key)) {
-			const read = stitchLimiter.run(job.id, true, () =>
-				journalS3.get(chunk.stash.key),
-			);
-			read.catch(() => job.headerStashes?.delete(chunk.stash.key));
-			job.headerStashes.set(chunk.stash.key, read);
+		if (part) {
+			plan.push(part);
+			state.lastPart = part;
+			state.headerPending = false;
 		}
-		carried += chunk.stash.bytes;
-		if (chunk.parts.length > 0 || carried >= MIN_PART) break;
+		state.nextChunk++;
 	}
-	const complete = accepted.length === job.chunks.length;
-	const plan = planStitch(0, accepted, { partial: !complete });
+	const complete = state.nextChunk === job.chunks.length;
+	if (complete) {
+		const part = state.planner.finish();
+		if (part) {
+			plan.push(part);
+			state.lastPart = part;
+		}
+	}
+	for (const part of plan) {
+		if (part.bytes < MIN_PART && (!complete || part !== state.lastPart)) {
+			job.stitchPlan = undefined;
+			throw new Error(`part ${part.partNumber} is under S3's 5 MiB minimum`);
+		}
+	}
 	job.stitchParts ??= new Map();
 	for (const part of plan) {
 		if (part.sources.some((source) => source.kind === "header")) continue;
@@ -2531,7 +2300,11 @@ function stitchAhead(job: Job) {
 		const written = stitchLimiter.run(job.id, true, () =>
 			writeStitchPart(job.key, uploadId, null, part),
 		);
-		written.catch(() => job.stitchParts?.delete(key));
+		written.catch(() => {
+			if (job.stitchPlan !== state) return;
+			job.stitchParts?.delete(key);
+			state.retryParts.set(key, part);
+		});
 		job.stitchParts.set(key, written);
 	}
 }
@@ -2569,7 +2342,9 @@ async function writeStitchParts(
 
 async function dropStashes(id: string) {
 	const keys = await journalS3.list(`stash/${id}/`);
-	await Promise.all(keys.map(({ key }) => journalS3.delete(key)));
+	await Promise.all(
+		keys.map(({ key }) => stashDeletes.run(() => journalS3.delete(key))),
+	);
 }
 
 const STASH_SWEEP_MS = 10 * 60_000;
@@ -2590,7 +2365,9 @@ async function sweepStashes() {
 			return job.status === "ready" || job.status === "error";
 		},
 	);
-	await Promise.all(stale.map(({ key }) => journalS3.delete(key)));
+	await Promise.all(
+		stale.map(({ key }) => stashDeletes.run(() => journalS3.delete(key))),
+	);
 }
 
 setInterval(() => {
@@ -2640,14 +2417,6 @@ async function verifyPlayable(job: Job) {
 
 // ---------------------------------------------------------------- summary ---
 
-function percentile(values: number[], p: number) {
-	if (values.length === 0) return 0;
-	const sorted = [...values].sort((a, b) => a - b);
-	return (
-		sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] ?? 0
-	);
-}
-
 /** Share of the export rendered, 0-1; 1 only once the MP4 is complete. */
 function jobProgress(job: Job) {
 	if (job.status === "ready") return 1;
@@ -2683,13 +2452,21 @@ function summary(job: Job) {
 		(stat) => stat.kind === "video" && !stat.duplicate,
 	);
 	const audio = job.taskStats.filter((stat) => stat.kind === "audio");
-	const pick = (list: Record<string, unknown>[], field: string) =>
-		list.map((stat) => Number(stat[field] ?? 0));
-	const describe = (list: Record<string, unknown>[], field: string) => ({
-		p50: Math.round(percentile(pick(list, field), 0.5)),
-		p95: Math.round(percentile(pick(list, field), 0.95)),
-		max: Math.round(Math.max(0, ...pick(list, field))),
-	});
+	const describe = (list: Record<string, unknown>[], field: string) => {
+		let max = 0;
+		const values = list
+			.map((stat) => {
+				const value = Number(stat[field] ?? 0);
+				max = Math.max(max, value);
+				return value;
+			})
+			.sort((a, b) => a - b);
+		return {
+			p50: Math.round(values[Math.floor(0.5 * values.length)] ?? 0),
+			p95: Math.round(values[Math.floor(0.95 * values.length)] ?? 0),
+			max: Math.round(max),
+		};
+	};
 	return {
 		id: job.id,
 		label: job.request.label,
@@ -3140,7 +2917,10 @@ Bun.serve({
 				return new Response(parsed, { status: 400 });
 			const body = parsed;
 			const started = performance.now();
-			await sourceIndex(body.recording.replace(/\/$/, ""), body.sourceRoot);
+			await sourceIndexes.get(
+				body.recording.replace(/\/$/, ""),
+				body.sourceRoot,
+			);
 			return Response.json({ ms: Math.round(performance.now() - started) });
 		}
 

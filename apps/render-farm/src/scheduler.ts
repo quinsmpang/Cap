@@ -61,7 +61,10 @@ export function pickQueued(
 	if (options.fifo) return queue.findIndex(eligible);
 
 	let best = -1;
-	let bestKey: number[] | null = null;
+	let bestPriority = 0;
+	let bestRunningTasks = 0;
+	let bestRequestedAt = 0;
+	let bestPosition = 0;
 	for (const [index, state] of queue.entries()) {
 		if (!eligible(state)) continue;
 		const task = state.task;
@@ -70,24 +73,20 @@ export function pickQueued(
 		const position = task.kind === "video" ? task.chunk : task.section;
 		const gating =
 			task.kind === "video" ? entry.head.has(task.chunk) : position === 0;
-		const key = [
-			gating ? 0 : 1,
-			entry.job.runningTasks,
-			entry.job.requestedAt,
-			position,
-		];
-		if (!bestKey || compareKeys(key, bestKey) < 0) {
+		const priority = gating ? 0 : 1;
+		const runningTasks = entry.job.runningTasks;
+		const requestedAt = entry.job.requestedAt;
+		let comparison = priority - bestPriority;
+		if (comparison === 0) comparison = runningTasks - bestRunningTasks;
+		if (comparison === 0) comparison = requestedAt - bestRequestedAt;
+		if (comparison === 0) comparison = position - bestPosition;
+		if (best < 0 || comparison < 0) {
 			best = index;
-			bestKey = key;
+			bestPriority = priority;
+			bestRunningTasks = runningTasks;
+			bestRequestedAt = requestedAt;
+			bestPosition = position;
 		}
 	}
 	return best;
-}
-
-function compareKeys(a: number[], b: number[]) {
-	for (const [index, value] of a.entries()) {
-		const difference = value - (b[index] ?? 0);
-		if (difference !== 0) return difference;
-	}
-	return 0;
 }

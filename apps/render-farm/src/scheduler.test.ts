@@ -75,6 +75,39 @@ describe("pickQueued", () => {
 		expect(pickQueued(queue, [older, newer], any, options)).toBe(2);
 	});
 
+	test("equal scores retain the first queued task", () => {
+		const jobs = [job("a", 0, 4), job("b", 0, 4)];
+		expect(pickQueued([video("b", 1), video("a", 1)], jobs, any, options)).toBe(
+			0,
+		);
+		expect(pickQueued([video("a", 1), video("b", 1)], jobs, any, options)).toBe(
+			0,
+		);
+	});
+
+	for (const value of [
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+		Number.NEGATIVE_INFINITY,
+	]) {
+		test(`non-finite load comparisons do not fall through to age: ${value}`, () => {
+			const jobs = [
+				job("a", 100, 4, { runningTasks: value }),
+				job("b", 0, 4, { runningTasks: value }),
+			];
+			expect(
+				pickQueued([video("a", 1), video("b", 0)], jobs, any, options),
+			).toBe(0);
+		});
+
+		test(`non-finite age comparisons do not fall through to position: ${value}`, () => {
+			const jobs = [job("a", value, 4), job("b", value, 4)];
+			expect(
+				pickQueued([video("a", 1), video("b", 0)], jobs, any, options),
+			).toBe(0);
+		});
+	}
+
 	test("held tasks wait until their hold expires", () => {
 		const resumed = job("resumed", 0, 4);
 		const queue = [video("resumed", 0, 2_000), video("resumed", 1)];

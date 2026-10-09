@@ -48,46 +48,65 @@ export function planStitch(
 	options: { partial?: boolean } = {},
 ): StitchPart[] {
 	const out: StitchPart[] = [];
-	let pending: StitchPart | null = {
-		partNumber: HEADER_PART,
-		sources: [{ kind: "header", bytes: headerBytes }],
-		bytes: headerBytes,
-	};
-	const emit = () => {
-		if (pending) out.push(pending);
-		pending = null;
-	};
+	const planner = new StitchPlanner(headerBytes);
 	for (const chunk of chunks) {
-		const source: StitchSource = {
-			kind: "stash",
-			key: chunk.stash.key,
-			bytes: chunk.stash.bytes,
-		};
-		if (!pending) {
-			if (chunk.parts.length > 0 || chunk.stash.bytes >= MIN_PART) {
-				out.push({
-					partNumber: chunk.slot,
-					sources: [source],
-					bytes: source.bytes,
-				});
-				continue;
-			}
-			pending = { partNumber: chunk.slot, sources: [], bytes: 0 };
-		}
-		pending.sources.push(source);
-		pending.bytes += source.bytes;
-		// A chunk's own parts must follow a finished part. Flushing as soon as
-		// a part is valid keeps what the coordinator downloads to a minimum:
-		// the next stash that can stand alone is copied instead.
-		if (chunk.parts.length > 0 || pending.bytes >= MIN_PART) emit();
+		const part = planner.append(chunk);
+		if (part) out.push(part);
 	}
-	if (!options.partial) emit();
+	if (!options.partial) {
+		const part = planner.finish();
+		if (part) out.push(part);
+	}
 	for (const part of options.partial ? out : out.slice(0, -1)) {
 		if (part.bytes < MIN_PART) {
 			throw new Error(`part ${part.partNumber} is under S3's 5 MiB minimum`);
 		}
 	}
 	return out;
+}
+
+export class StitchPlanner {
+	private pending: StitchPart | undefined;
+
+	constructor(headerBytes: number) {
+		this.pending = {
+			partNumber: HEADER_PART,
+			sources: [{ kind: "header", bytes: headerBytes }],
+			bytes: headerBytes,
+		};
+	}
+
+	append(chunk: StashedChunk) {
+		const source: StitchSource = {
+			kind: "stash",
+			key: chunk.stash.key,
+			bytes: chunk.stash.bytes,
+		};
+		if (!this.pending) {
+			if (chunk.parts.length > 0 || chunk.stash.bytes >= MIN_PART) {
+				return {
+					partNumber: chunk.slot,
+					sources: [source],
+					bytes: source.bytes,
+				};
+			}
+			this.pending = { partNumber: chunk.slot, sources: [], bytes: 0 };
+		}
+		this.pending.sources.push(source);
+		this.pending.bytes += source.bytes;
+		// A chunk's own parts must follow a finished part. Flushing as soon as
+		// a part is valid keeps what the coordinator downloads to a minimum:
+		// the next stash that can stand alone is copied instead.
+		if (chunk.parts.length > 0 || this.pending.bytes >= MIN_PART) {
+			return this.finish();
+		}
+	}
+
+	finish() {
+		const part = this.pending;
+		this.pending = undefined;
+		return part;
+	}
 }
 
 /**
@@ -189,7 +208,7 @@ export class StitchLimiter {
 	/** Called once a job has ended: none of its queued work is still wanted. */
 	cancel(job: string) {
 		const cancelled = this.waiting.filter((waiter) => waiter.job === job);
-		this.waiting = this.waiting.filter((waiter) => !cancelled.includes(waiter));
+		this.waiting = this.waiting.filter((waiter) => waiter.job !== job);
 		for (const waiter of cancelled) {
 			waiter.cancel(new Error(`job ${job} ended before its stitch ran`));
 		}

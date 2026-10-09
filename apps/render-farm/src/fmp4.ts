@@ -196,61 +196,76 @@ export function segmentHeader(input: {
 			0,
 			build((writer) => writer.u64(time)),
 		);
-	const make = (moofSize: number) => {
-		const videoTrun = fullBox(
+	const videoTrun = fullBox(
+		"trun",
+		0,
+		0x000001 | 0x000100 | 0x000200 | 0x000400,
+		build((writer) => {
+			writer.u32(input.videoSizes.length);
+			writer.u32(0);
+			input.videoSizes.forEach((size, index) => {
+				writer.u32(1000);
+				writer.u32(size);
+				writer.u32(index === 0 ? 0x02000000 : 0x01010000);
+			});
+		}),
+	);
+	const tracks = [
+		{
+			parts: [tfhd(VIDEO_TRACK), tfdt(input.firstFrame * 1000)],
+			trun: videoTrun,
+			dataOffset: 0,
+		},
+	];
+	if (input.audioSizes.length > 0) {
+		const audioTrun = fullBox(
 			"trun",
 			0,
-			0x000001 | 0x000100 | 0x000200 | 0x000400,
+			0x000001 | 0x000100 | 0x000200,
 			build((writer) => {
-				writer.u32(input.videoSizes.length);
-				writer.u32(moofSize + 8);
-				input.videoSizes.forEach((size, index) => {
-					writer.u32(1000);
+				writer.u32(input.audioSizes.length);
+				writer.u32(0);
+				for (const size of input.audioSizes) {
+					writer.u32(1024);
 					writer.u32(size);
-					// Segments always open on an IDR; B-frames are off.
-					writer.u32(index === 0 ? 0x02000000 : 0x01010000);
-				});
+				}
 			}),
 		);
-		const trafs = [
-			box("traf", tfhd(VIDEO_TRACK), tfdt(input.firstFrame * 1000), videoTrun),
-		];
-		if (input.audioSizes.length > 0) {
-			const audioTrun = fullBox(
-				"trun",
-				0,
-				0x000001 | 0x000100 | 0x000200,
-				build((writer) => {
-					writer.u32(input.audioSizes.length);
-					writer.u32(moofSize + 8 + videoBytes);
-					for (const size of input.audioSizes) {
-						writer.u32(1024);
-						writer.u32(size);
-					}
-				}),
-			);
-			trafs.push(
-				box(
-					"traf",
-					tfhd(AUDIO_TRACK),
-					tfdt(input.firstPacket * 1024),
-					audioTrun,
-				),
-			);
-		}
-		return box(
-			"moof",
-			fullBox(
-				"mfhd",
-				0,
-				0,
-				build((writer) => writer.u32(input.sequence)),
+		tracks.push({
+			parts: [tfhd(AUDIO_TRACK), tfdt(input.firstPacket * 1024)],
+			trun: audioTrun,
+			dataOffset: videoBytes,
+		});
+	}
+	const mfhd = fullBox(
+		"mfhd",
+		0,
+		0,
+		build((writer) => writer.u32(input.sequence)),
+	);
+	const moofSize = tracks.reduce(
+		(size, track) =>
+			size +
+			track.parts.reduce(
+				(bytes, part) => bytes + part.byteLength,
+				8 + track.trun.byteLength,
 			),
-			...trafs,
-		);
-	};
-	// trun data offsets are fixed width, so the moof size is known up front.
-	const moof = make(make(0).byteLength);
+		8 + mfhd.byteLength,
+	);
+	for (const track of tracks) {
+		new DataView(
+			track.trun.buffer,
+			track.trun.byteOffset,
+			track.trun.byteLength,
+		).setUint32(16, moofSize + 8 + track.dataOffset);
+	}
+	const moof = box(
+		"moof",
+		mfhd,
+		...tracks.map((track) => box("traf", ...track.parts, track.trun)),
+	);
+	if (moof.byteLength !== moofSize)
+		throw new Error("fragment header layout mismatch");
 	const mdat = build((writer) => {
 		writer.u32(8 + videoBytes + audioBytes);
 		writer.ascii("mdat");

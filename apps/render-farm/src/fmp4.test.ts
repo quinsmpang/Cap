@@ -48,6 +48,63 @@ describe("initSegment", () => {
 });
 
 describe("segmentHeader", () => {
+	test("large payload byte counts keep the original addition order before wrapping", () => {
+		const header = segmentHeader({
+			sequence: 1,
+			firstFrame: 0,
+			videoSizes: [2 ** 56, 0, 0],
+			firstPacket: 0,
+			audioSizes: [1],
+		});
+		const moof = parseBoxes(header, 0, header.byteLength - 8).find(
+			(box) => box.type === "moof",
+		);
+		if (!moof) throw new Error("missing moof");
+		const tracks = parseBoxes(moof.body).filter((box) => box.type === "traf");
+		const audio = tracks[1] && child(tracks[1], "trun");
+		expect(audio && u32(audio.body, 8)).toBe(208);
+	});
+
+	test("empty sample tables retain their data offsets", () => {
+		const header = segmentHeader({
+			sequence: 1,
+			firstFrame: 0,
+			videoSizes: [],
+			firstPacket: 0,
+			audioSizes: [],
+		});
+		const moof = parseBoxes(header).find((box) => box.type === "moof");
+		const traf = moof && child(moof, "traf");
+		const trun = traf && child(traf, "trun");
+		expect(trun && u32(trun.body, 4)).toBe(0);
+		expect(trun && u32(trun.body, 8)).toBe((moof?.size ?? 0) + 8);
+	});
+
+	test("data offsets preserve uint32 wrapping and decode timestamps remain 64-bit", () => {
+		const input = {
+			sequence: 1,
+			firstFrame: 0x1_0000_0000,
+			videoSizes: [0xffffffff, 101],
+			firstPacket: 0x1_0000_0000,
+			audioSizes: [23],
+		};
+		const header = segmentHeader(input);
+		const moof = parseBoxes(header).find((box) => box.type === "moof");
+		if (!moof) throw new Error("missing moof");
+		const tracks = parseBoxes(moof.body).filter((box) => box.type === "traf");
+		const video = tracks[0] && child(tracks[0], "trun");
+		const audio = tracks[1] && child(tracks[1], "trun");
+		const videoTime = tracks[0] && child(tracks[0], "tfdt");
+		const audioTime = tracks[1] && child(tracks[1], "tfdt");
+		expect(video && u32(video.body, 8)).toBe(moof.size + 8);
+		expect(audio && u32(audio.body, 8)).toBe(
+			(moof.size + 8 + 0x1_0000_0000 + 100) >>> 0,
+		);
+		expect(videoTime && u64(videoTime.body, 4)).toBe(input.firstFrame * 1000);
+		expect(audioTime && u64(audioTime.body, 4)).toBe(input.firstPacket * 1024);
+		expect(input.videoSizes).toEqual([0xffffffff, 101]);
+	});
+
 	test("trun offsets point at the video then audio bytes after the header", () => {
 		const videoSizes = [100, 50, 50];
 		const audioSizes = [20, 30];

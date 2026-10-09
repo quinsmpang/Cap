@@ -5,6 +5,7 @@ import {
 	planStitch,
 	type StashedChunk,
 	StitchLimiter,
+	StitchPlanner,
 	stashBytes,
 	uploadProblem,
 } from "./stitch";
@@ -135,6 +136,23 @@ describe("uploadProblem", () => {
 });
 
 describe("planStitch ahead of assembly", () => {
+	test("an open group waits for later chunks and emitted groups remain immutable", () => {
+		const planner = new StitchPlanner(0);
+		expect(planner.append(chunk(0, 1 * MB))).toBeUndefined();
+		const first = planner.append(chunk(1, 4 * MB));
+		expect(first?.partNumber).toBe(HEADER_PART);
+		expect(first?.bytes).toBe(5 * MB);
+		const snapshot = structuredClone(first);
+		const second = planner.append(chunk(2, 12 * MB));
+		expect(second?.sources).toEqual([
+			{ kind: "stash", key: "s/2", bytes: MIN_PART },
+		]);
+		expect(planner.append(chunk(3, 1))).toBeUndefined();
+		expect(planner.finish()?.bytes).toBe(1);
+		expect(planner.finish()).toBeUndefined();
+		expect(first).toEqual(snapshot);
+	});
+
 	test("parts planned for an accepted run are the parts of the final plan", () => {
 		const sizes = [0.3, 12, 0.2, 0.2, 7, 30, 1, 0.4, 6, 0.1].map((mb) =>
 			Math.round(mb * MB),
@@ -241,6 +259,36 @@ describe("stitch limiter", () => {
 		expect(started).toBe(2);
 		busy.release();
 		await blocking;
+	});
+
+	test("cancellation keeps admitted work and preserves other jobs' priority and order", async () => {
+		const limiter = new StitchLimiter({ total: 1, ahead: 1, aheadPerJob: 1 });
+		const gate = held();
+		const running = limiter.run("ended", true, async () => {
+			await gate.done;
+			return "running survived";
+		});
+		const order: number[] = [];
+		const queued = Array.from({ length: 12 }, (_, i) =>
+			limiter.run(i % 2 === 0 ? "ended" : "other", i % 4 === 1, async () => {
+				order.push(i);
+				return i;
+			}),
+		);
+		const settled = Promise.allSettled(queued);
+		limiter.promote("ended");
+		limiter.cancel("ended");
+		limiter.cancel("ended");
+		limiter.cancel("missing");
+		gate.release();
+		expect(await running).toBe("running survived");
+		const outcomes = await settled;
+		expect(outcomes.map((outcome) => outcome.status)).toEqual(
+			Array.from({ length: 12 }, (_, i) =>
+				i % 2 === 0 ? "rejected" : "fulfilled",
+			),
+		);
+		expect(order).toEqual([3, 7, 11, 1, 5, 9]);
 	});
 
 	test("cancelling an ended job drops all its queued work, promoted too", async () => {
