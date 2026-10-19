@@ -1937,8 +1937,11 @@ pub fn format_project_name<'a>(
 pub async fn start_recording(
     app: AppHandle,
     state_mtx: MutableState<'_, App>,
-    inputs: StartRecordingInputs,
+    mut inputs: StartRecordingInputs,
 ) -> Result<RecordingAction, String> {
+    if inputs.mode == RecordingMode::Instant {
+        inputs.mode = RecordingMode::Studio;
+    }
     #[cfg(target_os = "linux")]
     if inputs.mode != RecordingMode::Instant && linux_instant::current(&app).is_some() {
         return Err("Finish the pending Instant cleanup before recording".into());
