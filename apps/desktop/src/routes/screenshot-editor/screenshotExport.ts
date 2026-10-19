@@ -457,20 +457,10 @@ export const copyCurrentScreenshotShareLink = async (
 };
 
 export const uploadScreenshotShareBlob = async (
-	blob: Blob,
-	projectPath: string,
-	contentHash?: string,
-) => {
-	const buffer = await blob.arrayBuffer();
-	const result = await commands.uploadRenderedScreenshot(
-		Array.from(new Uint8Array(buffer)),
-		blob.type,
-		projectPath,
-		contentHash ?? null,
-	);
-
-	return shareLinkFromUploadResult(result);
-};
+	_blob: Blob,
+	_projectPath: string,
+	_contentHash?: string,
+) => null;
 
 export async function createScreenshotShareLinkFromProjectPath(
 	path: string,

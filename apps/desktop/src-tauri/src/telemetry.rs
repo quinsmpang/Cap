@@ -10,8 +10,6 @@ use std::{
 use tauri::AppHandle;
 use tracing::debug;
 
-use crate::auth::AuthStore;
-
 /// Baked in at compile time so self-built binaries send nothing.
 const CLIENT_ID: Option<&str> = option_env!("VITE_OPENPANEL_CLIENT_ID");
 /// `/track` accepts origin-allowlisted requests without a client secret — the
@@ -416,10 +414,7 @@ pub fn async_capture_event(app: &AppHandle, event: AnalyticsEvent) {
         return;
     }
 
-    let profile_id = AuthStore::get(app)
-        .ok()
-        .flatten()
-        .and_then(|auth| auth.user_id);
+    let profile_id: Option<String> = None;
 
     tokio::spawn(async move {
         let (name, mut properties) = analytics_event(event);

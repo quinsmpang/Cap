@@ -8,7 +8,7 @@ import {
 	defaultKeyboardSettings,
 	type KeyboardSettings,
 } from "~/store/keyboard";
-import type { OrganizationBrandColorSwatch } from "~/utils/organization-branding";
+import type { OrganizationBrandColorSwatch } from "~/utils/brand-colors";
 import { commands } from "~/utils/tauri";
 import IconCapChevronDown from "~icons/cap/chevron-down";
 import IconCapCircleCheck from "~icons/cap/circle-check";

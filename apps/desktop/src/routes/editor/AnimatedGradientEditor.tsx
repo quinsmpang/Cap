@@ -11,7 +11,7 @@ import {
 } from "solid-js";
 import { produce } from "solid-js/store";
 import { animatedGradientsStore } from "~/store";
-import type { OrganizationBrandColorSwatch } from "~/utils/organization-branding";
+import type { OrganizationBrandColorSwatch } from "~/utils/brand-colors";
 import {
 	type AnimatedGradientConfig,
 	type AnimatedGradientControl,

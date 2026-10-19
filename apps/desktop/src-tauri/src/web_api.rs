@@ -3,11 +3,7 @@ use tauri::{Emitter, Manager, Runtime};
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
-use crate::{
-    ArcLock,
-    auth::{AuthSecret, AuthStore},
-    http_client,
-};
+use crate::{ArcLock, http_client};
 
 #[derive(Error, Debug)]
 pub enum AuthedApiError {
@@ -118,11 +114,8 @@ impl UploadRequestContext {
         Ok(())
     }
 
-    pub(crate) async fn check(&self, app: &tauri::AppHandle) -> Result<(), AuthedApiError> {
-        let auth = AuthStore::get(app)
-            .map_err(AuthedApiError::AuthStore)?
-            .ok_or(AuthedApiError::InvalidAuthentication)?;
-        self.check_identity(&current_server_url(app).await?, auth.user_id.as_deref())
+    pub(crate) async fn check(&self, _app: &tauri::AppHandle) -> Result<(), AuthedApiError> {
+        Err(AuthedApiError::InvalidAuthentication)
     }
 
     pub(crate) async fn run<F: std::future::Future>(self, future: F) -> F::Output {
@@ -153,26 +146,6 @@ pub(crate) fn inherit_upload_context<F: std::future::Future>(
     }
 }
 
-async fn do_authed_request(
-    client: &reqwest::Client,
-    auth: &AuthStore,
-    build: impl FnOnce(&reqwest::Client, String) -> reqwest::RequestBuilder,
-    url: String,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let req = build(client, url).header(
-        "Authorization",
-        format!(
-            "Bearer {}",
-            match &auth.secret {
-                AuthSecret::ApiKey { api_key } => api_key,
-                AuthSecret::Session { token, .. } => token,
-            }
-        ),
-    );
-
-    apply_env_headers(req).send().await
-}
-
 #[allow(async_fn_in_trait)]
 pub trait ManagerExt<R: Runtime>: Manager<R> {
     async fn authed_api_request(
@@ -195,38 +168,11 @@ pub trait ManagerExt<R: Runtime>: Manager<R> {
 impl<T: Manager<R> + Emitter<R>, R: Runtime> ManagerExt<R> for T {
     async fn authed_api_request(
         &self,
-        path: impl Into<String>,
-        build: impl FnOnce(&reqwest::Client, String) -> reqwest::RequestBuilder,
+        _path: impl Into<String>,
+        _build: impl FnOnce(&reqwest::Client, String) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, AuthedApiError> {
-        let Some(auth) = AuthStore::get(self.app_handle()).map_err(AuthedApiError::AuthStore)?
-        else {
-            debug!("Skipping authenticated API request because user is not logged in");
-            return Err(AuthedApiError::InvalidAuthentication);
-        };
-
-        let path = path.into();
-        let server_url = crate::upload::lifecycle::cancellable(current_server_url(self)).await??;
-        let server_url = if let Some(context) = UploadRequestContext::current() {
-            context.check_identity(&server_url, auth.user_id.as_deref())?;
-            context.server_url
-        } else {
-            server_url
-        };
-        let url = format!("{server_url}{path}");
-        let response = crate::upload::lifecycle::cancellable(do_authed_request(
-            &self.state::<http_client::HttpClient>(),
-            &auth,
-            build,
-            url,
-        ))
-        .await??;
-
-        if response.status() == StatusCode::UNAUTHORIZED {
-            error!("Authentication expired. Please log in again.");
-            return Err(AuthedApiError::InvalidAuthentication);
-        }
-
-        Ok(response)
+        debug!("Skipping authenticated API request because authentication is disabled");
+        Err(AuthedApiError::InvalidAuthentication)
     }
 
     async fn api_request(

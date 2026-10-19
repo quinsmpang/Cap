@@ -1,5 +1,5 @@
 use super::*;
-use crate::{auth::AuthStore, web_api::UploadRequestContext};
+use crate::web_api::UploadRequestContext;
 use futures::FutureExt;
 use std::{io::Write, sync::atomic::AtomicBool};
 
@@ -80,9 +80,7 @@ pub(crate) async fn prepare(
     required_audio: bool,
 ) -> Result<Arc<Session>, AuthedApiError> {
     let server_url = app.make_app_url("").await.trim_end_matches('/').to_string();
-    let owner_id = AuthStore::get(app)
-        .map_err(AuthedApiError::AuthStore)?
-        .and_then(|auth| auth.user_id);
+    let owner_id: Option<String> = None;
     let context = UploadRequestContext::new(
         server_url.clone(),
         owner_id

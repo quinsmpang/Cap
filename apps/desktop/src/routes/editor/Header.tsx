@@ -17,10 +17,8 @@ import CaptionControlsWindows11 from "~/components/titlebar/controls/CaptionCont
 import { trackEvent } from "~/utils/analytics";
 import { commands } from "~/utils/tauri";
 import { useEditorContext } from "./context";
-import OrganizationDropdown from "./OrganizationDropdown";
 import PresetsDropdown from "./PresetsDropdown";
 import { createRecordingTitleSave } from "./recording-title-save";
-import ShareButton from "./ShareButton";
 import { EditorButton } from "./ui";
 
 export type ResolutionOption = {
@@ -182,7 +180,6 @@ export function Header(props: {
 					leftIcon={<IconCapRedo />}
 				/>
 				<div class="mx-1.5 w-px h-4 shrink-0 bg-ed-line-strong" />
-				<OrganizationDropdown />
 				<PresetsDropdown />
 				<EditorButton
 					title="Clips"
@@ -224,7 +221,6 @@ export function Header(props: {
 						</span>
 					</EditorButton>
 				</Show>
-				<ShareButton />
 				<button
 					type="button"
 					class={cx(

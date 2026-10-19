@@ -3,7 +3,7 @@ import {
 	getHexColorDigitCount,
 	normalizeOpaqueHexColor,
 } from "~/utils/hex-color";
-import type { OrganizationBrandColorSwatch } from "~/utils/organization-branding";
+import type { OrganizationBrandColorSwatch } from "~/utils/brand-colors";
 import { BrandColorsDropdown } from "./BrandColorsDropdown";
 import { getColorPreviewBorderColor } from "./color-utils";
 import { TextInput } from "./TextInput";

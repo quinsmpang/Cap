@@ -31,7 +31,6 @@ import {
 import { defaultKeyboardSettings } from "~/store/keyboard";
 import { createTauriEventListener } from "~/utils/createEventListener";
 import { createPresets } from "~/utils/createPresets";
-import { createCustomDomainQuery } from "~/utils/queries";
 import { isRecordingStorageError } from "~/utils/recording";
 import {
 	type CanvasControls,
@@ -154,7 +153,7 @@ export type ModalDialog =
 	  };
 
 export type LayoutMode =
-	| { type: "export"; destination?: "link" }
+	| { type: "export" }
 	| { type: "transcript" }
 	| { type: "clips" };
 
@@ -226,11 +225,6 @@ export const MAX_ZOOM_IN = 3;
 export type RenderState =
 	| { type: "starting" }
 	| { type: "rendering"; progress: FramesRendered };
-
-export type CustomDomainResponse = {
-	custom_domain: string | null;
-	domain_verified: boolean | null;
-};
 
 export type CornerRoundingType = "rounded" | "squircle";
 
@@ -2136,7 +2130,6 @@ export const [EditorContextProvider, useBaseEditorContext] =
 						console.error("Failed to load system audio waveforms:", error),
 					);
 			});
-			const customDomain = createCustomDomainQuery();
 			const hasRecordedKeyboardEvents = createMemo(() => {
 				const meta = props.meta();
 				if (meta.type === "single") return false;
@@ -2479,7 +2472,6 @@ export const [EditorContextProvider, useBaseEditorContext] =
 				meta() {
 					return props.meta();
 				},
-				customDomain,
 				refetchMeta: () => props.refetchMeta(),
 				editorInstance: props.editorInstance,
 				dialog,

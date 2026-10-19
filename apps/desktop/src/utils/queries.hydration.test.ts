@@ -31,7 +31,6 @@ vi.mock("~/routes/(window-chrome)/OptionsContext", () => ({
 	useRecordingOptions: vi.fn(),
 }));
 vi.mock("~/store", () => ({
-	authStore: {},
 	generalSettingsStore: {},
 	recordingSettingsStore: {
 		get: fixture.getSettings,
@@ -41,10 +40,6 @@ vi.mock("~/store", () => ({
 }));
 vi.mock("./events", () => ({ createQueryInvalidate: vi.fn() }));
 vi.mock("./tauri", () => ({ commands: {} }));
-vi.mock("./web-api", () => ({
-	orgCustomDomainClient: {},
-	protectedHeaders: vi.fn(),
-}));
 
 import { createOptionsQuery } from "./queries";
 

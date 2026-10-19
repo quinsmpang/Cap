@@ -1,5 +1,4 @@
 import { Button } from "@cap/ui-solid";
-import { createWritableMemo } from "@solid-primitives/memo";
 import {
 	isPermissionGranted,
 	requestPermission,
@@ -27,11 +26,9 @@ import themePreviewLight from "~/assets/theme-previews/light.jpg";
 import { Input, Slider } from "~/routes/editor/ui";
 import {
 	audioEnhancementStore,
-	authStore,
 	generalSettingsStore,
 	recordingStartSafetyStore,
 } from "~/store";
-import { clientEnv } from "~/utils/env";
 import {
 	deriveGeneralSettings,
 	type GeneralSettingsStore,
@@ -711,26 +708,6 @@ function Inner(props: {
 					}}
 				/>
 
-				<ServerURLSetting
-					value={settings.serverUrl ?? clientEnv.VITE_SERVER_URL}
-					defaultValue={clientEnv.VITE_SERVER_URL}
-					onChange={async (v) => {
-						const url = new URL(v);
-						const origin = url.origin;
-
-						if (
-							!(await confirm(
-								`Are you sure you want to change the server URL to '${origin}'? You will need to sign in again.`,
-							))
-						)
-							return;
-
-						await authStore.set(undefined);
-						await commands.setServerUrl(origin);
-						handleChange("serverUrl", origin);
-					}}
-				/>
-
 				<TelemetryCard
 					value={settings.enableTelemetry !== false}
 					onChange={(v) => handleChange("enableTelemetry", v)}
@@ -937,62 +914,6 @@ function SegmentedControl<T extends string | number>(props: {
 				}}
 			</For>
 		</div>
-	);
-}
-
-function ServerURLSetting(props: {
-	value: string;
-	defaultValue: string;
-	onChange: (v: string) => void;
-}) {
-	const [value, setValue] = createWritableMemo(() => props.value);
-	const isDefaultValue = () =>
-		props.value === props.defaultValue && value() === props.defaultValue;
-	const resetToDefault = () => {
-		if (props.value === props.defaultValue) {
-			setValue(props.defaultValue);
-			return;
-		}
-
-		props.onChange(props.defaultValue);
-	};
-
-	return (
-		<Section
-			title="Self-host"
-			description="Only change this if you are running your own instance of Cap Web."
-		>
-			<SectionCard padded>
-				<div class="flex flex-col gap-3">
-					<label class="flex flex-col gap-1.5">
-						<span class="text-[13px] text-gray-12">Cap Server URL</span>
-						<Input
-							class="bg-gray-3"
-							value={value()}
-							onInput={(e) => setValue(e.currentTarget.value)}
-						/>
-					</label>
-					<div class="flex justify-end gap-2">
-						<Button
-							size="sm"
-							variant="gray"
-							disabled={isDefaultValue()}
-							onClick={resetToDefault}
-						>
-							Reset to Default
-						</Button>
-						<Button
-							size="sm"
-							variant="dark"
-							disabled={props.value === value()}
-							onClick={() => props.onChange(value())}
-						>
-							Update
-						</Button>
-					</div>
-				</div>
-			</SectionCard>
-		</Section>
 	);
 }
 

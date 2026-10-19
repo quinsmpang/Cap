@@ -50,10 +50,9 @@ import {
 	generalSettingsStore,
 } from "~/store";
 import {
-	createSelectedOrganization,
-	getOrganizationBrandColorSwatches,
+	EMPTY_BRAND_COLOR_SWATCHES,
 	type OrganizationBrandColorSwatch,
-} from "~/utils/organization-branding";
+} from "~/utils/brand-colors";
 import {
 	type AnimatedGradientConfig,
 	type AnimatedGradientLibrary,
@@ -577,12 +576,7 @@ function ConfigSidebarContent() {
 		editorState,
 		meta,
 	} = useEditorContext();
-	const organizationSelection = createSelectedOrganization();
-	const brandColorSwatches = createMemo(() =>
-		getOrganizationBrandColorSwatches(
-			organizationSelection.selectedOrganization(),
-		),
-	);
+	const brandColorSwatches = createMemo(() => EMPTY_BRAND_COLOR_SWATCHES);
 
 	const cursorIdleDelay = () =>
 		((project.cursor as { hideWhenIdleDelay?: number }).hideWhenIdleDelay ??

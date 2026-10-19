@@ -6,8 +6,7 @@
 		{ "path": "./packages/ui-solid" },
 		{ "path": "./packages/utils" },
 		{ "path": "./apps/desktop" },
-		{ "path": "./apps/chrome-extension" },
-		{ "path": "./apps/web" }
+		{ "path": "./apps/chrome-extension" }
 	],
 	"compilerOptions": {
 		"plugins": [{ "name": "@effect/language-service" }]

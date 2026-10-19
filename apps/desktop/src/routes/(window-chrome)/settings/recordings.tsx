@@ -32,7 +32,6 @@ import {
 	commands,
 	events,
 	type RecordingMetaWithMetadata,
-	type UploadProgress,
 } from "~/utils/tauri";
 import IconLucideImport from "~icons/lucide/import";
 import IconLucideSearch from "~icons/lucide/search";
@@ -462,52 +461,6 @@ function RecordingItem(props: {
 					>
 						<IconLucideEdit class="size-4" />
 					</TooltipIconButton>
-				</Show>
-				<Show when={mode() === "instant"}>
-					{(_) => {
-						const reupload = createMutation(() => ({
-							mutationFn: () =>
-								commands.uploadExportedVideo(
-									props.recording.path,
-									"Reupload",
-									new Channel<UploadProgress>((_progress) => {}),
-									null,
-								),
-						}));
-
-						return (
-							<>
-								<Show
-									when={props.uploadProgress || reupload.isPending}
-									fallback={
-										<TooltipIconButton
-											tooltipText="Reupload"
-											onClick={() => reupload.mutate()}
-										>
-											<IconLucideRotateCcw class="size-4" />
-										</TooltipIconButton>
-									}
-								>
-									<ProgressCircle
-										variant="primary"
-										progress={props.uploadProgress || 0}
-										size="sm"
-									/>
-								</Show>
-
-								<Show when={props.recording.meta.sharing}>
-									{(sharing) => (
-										<TooltipIconButton
-											tooltipText="Open link"
-											onClick={() => shell.open(sharing().link)}
-										>
-											<IconCapLink class="size-4" />
-										</TooltipIconButton>
-									)}
-								</Show>
-							</>
-						);
-					}}
 				</Show>
 				<TooltipIconButton
 					tooltipText="Open recording bundle"

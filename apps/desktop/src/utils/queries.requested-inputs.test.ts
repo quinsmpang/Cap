@@ -72,7 +72,6 @@ vi.mock("~/routes/(window-chrome)/OptionsContext", () => ({
 	}),
 }));
 vi.mock("~/store", () => ({
-	authStore: {},
 	generalSettingsStore: {},
 	recordingSettingsStore: {
 		get: fixture.getSettings,
@@ -86,10 +85,6 @@ vi.mock("./tauri", () => ({
 		setMicInput: fixture.setMicInput,
 		setCameraInput: fixture.setCameraInput,
 	},
-}));
-vi.mock("./web-api", () => ({
-	orgCustomDomainClient: {},
-	protectedHeaders: vi.fn(),
 }));
 
 import {

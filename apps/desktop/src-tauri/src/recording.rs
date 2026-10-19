@@ -68,7 +68,6 @@ use crate::{
     RecordingStopped, VideoUploadInfo,
     api::PresignedS3PutRequestMethod,
     audio::AppSounds,
-    auth::AuthStore,
     create_screenshot, create_screenshot_source_from_segments,
     general_settings::{GeneralSettingsStore, PostDeletionBehaviour, PostStudioRecordingBehaviour},
     open_external_link,
@@ -2066,12 +2065,7 @@ async fn start_recording_prepared(
         drop(_input_operation.take());
     }
 
-    let instant_auth = if matches!(inputs.mode, RecordingMode::Instant) {
-        AuthStore::get(&app).ok().flatten()
-    } else {
-        None
-    };
-    if let Some(error) = recording_start_mode_error(inputs.mode, instant_auth.is_some()) {
+    if let Some(error) = recording_start_mode_error(inputs.mode, false) {
         state_mtx.write().await.clear_pending_recording();
         notify_recording_start_failed(&app, error);
         return Err(error.to_string());
@@ -2281,86 +2275,19 @@ async fn start_recording_prepared(
         warn!(%error, "Failed to update camera window content protection");
     }
 
-    let (video_upload_info, instant_mode_max_resolution) = match inputs.mode {
+    let instant_mode_max_resolution = cap_recording::PRO_INSTANT_MODE_MAX_RESOLUTION;
+    match inputs.mode {
         RecordingMode::Instant => {
-            let Some(auth) = instant_auth else {
-                let error = "Please sign in to use instant recording".to_string();
-                state_mtx.write().await.clear_pending_recording();
-                notify_recording_start_failed(&app, &error);
-                return Err(error);
-            };
-            let instant_mode_max_resolution = if auth.is_upgraded() {
-                general_settings
-                    .map_or(cap_recording::PRO_INSTANT_MODE_MAX_RESOLUTION, |settings| {
-                        settings.instant_mode_max_resolution
-                    })
-            } else {
-                cap_recording::FREE_INSTANT_MODE_MAX_RESOLUTION
-            };
-            let upload_mode = if matches!(inputs.capture_target, ScreenCaptureTarget::CameraOnly) {
-                "desktopMP4"
-            } else {
-                "desktopSegments"
-            };
-
-            let s3_config = match crate::upload::create_or_get_video_with_mode(
-                &app,
-                false,
-                None,
-                Some(project_name.clone()),
-                None,
-                inputs.organization_id.clone(),
-                upload_mode,
-            )
-            .await
-            {
-                Ok(meta) => meta,
-                Err(AuthedApiError::InvalidAuthentication) => {
-                    state_mtx.write().await.clear_pending_recording();
-                    // Returned as an action rather than an error, but the picker that
-                    // invoked us may already be gone — surface it as a start failure too.
-                    notify_recording_start_failed(
-                        &app,
-                        "Your session has expired. Please sign in again to use instant recording.",
-                    );
-                    return Ok(RecordingAction::InvalidAuthentication);
-                }
-                Err(AuthedApiError::UpgradeRequired) => {
-                    state_mtx.write().await.clear_pending_recording();
-                    notify_recording_start_failed(
-                        &app,
-                        "Instant recording requires an upgraded plan.",
-                    );
-                    return Ok(RecordingAction::UpgradeRequired);
-                }
-                Err(err) => {
-                    let error = format!("Could not create the shareable link: {err}");
-                    state_mtx.write().await.clear_pending_recording();
-                    notify_recording_start_failed(&app, &error);
-                    return Err(error);
-                }
-            };
-
-            let link = app.make_app_url(format!("/s/{}", s3_config.id)).await;
-            info!("Pre-created shareable link: {}", link);
-
-            (
-                Some(VideoUploadInfo {
-                    id: s3_config.id.to_string(),
-                    link: link.clone(),
-                    config: s3_config,
-                }),
-                instant_mode_max_resolution,
-            )
+            return Err("Instant recording is not available in local-only mode".to_string());
         }
-        RecordingMode::Studio => (None, cap_recording::PRO_INSTANT_MODE_MAX_RESOLUTION),
+        RecordingMode::Studio => {}
         RecordingMode::Screenshot => {
             let error = "Use take_screenshot for screenshots".to_string();
             state_mtx.write().await.clear_pending_recording();
             notify_recording_start_failed(&app, &error);
             return Err(error);
         }
-    };
+    }
 
     let meta = RecordingMeta {
         platform: Some(Platform::default()),
@@ -2725,143 +2652,7 @@ async fn start_recording_prepared(
                             })
                         }
                         RecordingMode::Instant => {
-                            let Some(video_upload_info) = video_upload_info.clone() else {
-                                return Err(anyhow!("Video upload info not found"));
-                            };
-
-                            let mut builder = instant_recording::Actor::builder(
-                                recording_dir.clone(),
-                                inputs.capture_target.clone(),
-                            )
-                            .with_system_audio(inputs.capture_system_audio)
-                            .with_max_output_size(instant_mode_max_resolution);
-
-                            builder = builder.with_start_gate(start_gate.clone());
-
-                            #[cfg(target_os = "macos")]
-                            {
-                                builder = builder.with_excluded_windows(excluded_windows.clone());
-                            }
-
-                            if let Some(camera_feed) = camera_feed.clone() {
-                                builder = builder.with_camera_feed(camera_feed);
-                            }
-
-                            if let Some(mic_feed) = mic_feed.clone() {
-                                builder = builder.with_mic_feed(mic_feed);
-                            }
-
-                            #[cfg(target_os = "linux")]
-                            let attempt = linux_instant::current(&app_handle)
-                                .ok_or_else(|| anyhow!("Instant startup owner was lost"))?;
-                            #[cfg(target_os = "linux")]
-                            attempt
-                                .attach(recording_dir.clone(), builder.lifecycle())
-                                .await
-                                .map_err(anyhow::Error::msg)?;
-                            #[cfg(target_os = "linux")]
-                            {
-                                let prepared = match clean_generation {
-                                    Some(generation) => linux_instant::prepare_screen_camera(
-                                        &app_handle,
-                                        &attempt,
-                                        generation,
-                                        &inputs,
-                                        &requested_inputs,
-                                        camera_feed.clone(),
-                                    )
-                                    .await
-                                    .map_err(anyhow::Error::msg)?,
-                                    None => None,
-                                };
-                                builder = linux_instant::configure_screen_camera(
-                                    builder,
-                                    &inputs.capture_target,
-                                    requested_inputs.camera.value.is_some(),
-                                    prepared,
-                                )
-                                .map_err(anyhow::Error::msg)?;
-                                attempt.checked(Ok(())).map_err(anyhow::Error::msg)?;
-                            }
-                            let upload_session = crate::upload::lifecycle::prepare(
-                                &app_handle,
-                                &recording_dir,
-                                &video_upload_info.id,
-                                inputs.capture_system_audio || mic_feed.is_some(),
-                            )
-                            .await
-                            .map_err(anyhow::Error::from)?;
-                            let handle = builder
-                                .build(
-                                    #[cfg(target_os = "macos")]
-                                    shareable_content.clone(),
-                                )
-                                .await
-                                .map_err(|e| {
-                                    error!("Failed to spawn instant recording actor: {e:#}");
-                                    e
-                                })?;
-
-                            #[cfg(target_os = "linux")]
-                            let handle = Arc::new(handle);
-                            #[cfg(target_os = "linux")]
-                            let segment_upload = {
-                                let events = handle.take_segment_rx();
-                                linux_instant::persist_upload_start(
-                                    &recording_dir,
-                                    &video_upload_info,
-                                    events.is_some(),
-                                )
-                                .map_err(anyhow::Error::msg)?;
-                                attempt.upload_started();
-                                Arc::new(tokio::sync::Mutex::new(
-                                    crate::upload::strict_instant::spawn(
-                                        app_handle.clone(),
-                                        upload_session,
-                                        video_upload_info.clone(),
-                                        events,
-                                        attempt.upload(),
-                                        inputs.capture_system_audio || mic_feed.is_some(),
-                                    ),
-                                ))
-                            };
-                            #[cfg(not(target_os = "linux"))]
-                            let segment_upload = {
-                                let segment_rx = handle.take_segment_rx();
-
-                                if let Some(rx) = segment_rx {
-                                    SegmentUploader::spawn(
-                                        app_handle.clone(),
-                                        rx,
-                                        Some(finish_upload_rx.clone()),
-                                        upload_session,
-                                        video_upload_info.clone(),
-                                        inputs.capture_system_audio || mic_feed.is_some(),
-                                    )
-                                } else {
-                                    let progressive_upload = InstantMultipartUpload::spawn(
-                                        app_handle.clone(),
-                                        recording_dir.join("content/output.mp4"),
-                                        video_upload_info.clone(),
-                                        upload_session,
-                                        Some(finish_upload_rx.clone()),
-                                        inputs.capture_system_audio || mic_feed.is_some(),
-                                    );
-                                    SegmentUploader {
-                                        handle: progressive_upload.handle,
-                                        session: progressive_upload.session,
-                                    }
-                                }
-                            };
-
-                            Ok(InProgressRecording::Instant {
-                                handle,
-                                segment_upload,
-                                video_upload_info,
-                                common: common.clone(),
-                                mic_feed: mic_feed.clone(),
-                                camera_feed: camera_feed.clone(),
-                            })
+                            return Err(anyhow!("Instant recording is not available in local-only mode"));
                         }
                         RecordingMode::Screenshot => Err(anyhow!(
                             "Screenshot mode should be handled via take_screenshot"
