@@ -80,8 +80,6 @@ use crate::{
     },
 };
 
-#[cfg(not(target_os = "linux"))]
-use crate::upload::InstantMultipartUpload;
 
 fn recording_stopped_share_url(link: &str) -> String {
     if link.contains('?') {
@@ -2278,7 +2276,6 @@ async fn start_recording_prepared(
         warn!(%error, "Failed to update camera window content protection");
     }
 
-    let instant_mode_max_resolution = cap_recording::PRO_INSTANT_MODE_MAX_RESOLUTION;
     match inputs.mode {
         RecordingMode::Instant => {
             return Err("Instant recording is not available in local-only mode".to_string());
@@ -2436,9 +2433,9 @@ async fn start_recording_prepared(
         }
     };
 
-    let (finish_upload_tx, finish_upload_rx) = flume::bounded(1);
+    let (finish_upload_tx, _finish_upload_rx) = flume::bounded(1);
     #[cfg(target_os = "linux")]
-    drop(finish_upload_rx);
+    drop(_finish_upload_rx);
 
     if _input_operation.is_none() {
         _input_operation = Some(requested_state.operation.lock().await);

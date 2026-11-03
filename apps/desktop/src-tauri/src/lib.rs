@@ -93,7 +93,6 @@ use editor_window::{EditorInstances, PendingEditorInstances, WindowEditorInstanc
 use ffmpeg::ffi::AV_TIME_BASE;
 use general_settings::GeneralSettingsStore;
 use kameo::{Actor, actor::ActorRef};
-use notifications::NotificationType;
 use recording::{InProgressRecording, RecordingEvent, RecordingInputKind};
 use scap_targets::{Display, DisplayId, WindowId, bounds::LogicalBounds};
 use screenshot_editor::{
@@ -123,7 +122,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::Listener;
-use tauri::{AppHandle, Emitter, Manager, State, Window, WindowEvent, ipc::Channel};
+use tauri::{AppHandle, Emitter, Manager, State, Window, WindowEvent};
 #[cfg(target_os = "linux")]
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -135,9 +134,6 @@ use tauri_plugin_shell::ShellExt;
 use tauri_specta::Event;
 use tokio::sync::{Mutex, RwLock, oneshot, watch};
 use tracing::*;
-use upload::{create_or_get_video, upload_screenshot_bytes, upload_screenshot_file, upload_video};
-use web_api::AuthedApiError;
-use web_api::ManagerExt as WebManagerExt;
 #[cfg(target_os = "macos")]
 use windows::hide_overlay;
 use windows::{
@@ -146,7 +142,7 @@ use windows::{
 };
 
 use crate::recording_settings::{RecordingSettingsStore, RecordingTargetMode};
-use crate::{recording::start_recording, upload::build_video_meta};
+use crate::recording::start_recording;
 use exit_shutdown::{
     AppExitAction, ExitBlocked, ExitRequestDecision, app_exit_action, collect_device_inventory,
     handle_exit_requested, prepare_then_begin_exit, recording_start_allowed, run_while_active,
@@ -5187,20 +5183,6 @@ fn load_screenshot_project_meta(
     Ok((project_path, meta))
 }
 
-fn save_screenshot_sharing(
-    project_path: &std::path::Path,
-    mut meta: RecordingMeta,
-    uploaded: &upload::UploadedItem,
-    content_hash: Option<String>,
-) -> Result<(), String> {
-    meta.sharing = Some(SharingMeta {
-        link: uploaded.link.clone(),
-        id: uploaded.id.clone(),
-        content_hash,
-    });
-    meta.save_for_project()
-        .map_err(|err| format!("Error saving project {}: {err}", project_path.display()))
-}
 
 #[derive(Serialize, Type, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -5237,12 +5219,6 @@ fn screenshot_share_link_for_hash(
     None
 }
 
-async fn upgrade_required_result(app: &AppHandle) -> UploadResult {
-    if let Err(error) = open_pricing_page(app).await {
-        warn!(%error, "Failed to open pricing page");
-    }
-    UploadResult::UpgradeRequired
-}
 
 #[tauri::command]
 #[specta::specta]

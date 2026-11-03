@@ -1,4 +1,3 @@
-use reqwest::StatusCode;
 use tauri::{Emitter, Manager, Runtime};
 use thiserror::Error;
 use tracing::{debug, error, warn};
